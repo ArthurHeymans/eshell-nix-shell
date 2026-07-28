@@ -39,3 +39,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Keep `eshell-life-is-too-much` as Eshell's unmodified generic kill-or-bury
   entry point; interactive `C-d` deactivation remains in the minor-mode keymap.
 - Let `make all` skip `package-lint` cleanly when it is not installed.
+- Redraw the prompt after `C-d` pops an environment, and suppress the stray
+  `t` output from managed `exit` so the restored package indicator starts on
+  the next line.

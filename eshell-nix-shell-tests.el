@@ -165,18 +165,23 @@
    (advice--p (advice--symbol-function 'eshell-life-is-too-much))))
 
 (ert-deftest eshell-nix-shell-ctrl-d-key-pops-at-empty-prompt ()
-  "The minor-mode keymap handles `C-d' before custom Eshell bindings."
+  "The minor-mode keymap handles `C-d' and redraws the outer prompt."
   (eshell-nix-shell-tests--with-eshell
     (setq-local process-environment '("PATH=/zero" "L=zero"))
     (eshell-set-path '("/zero"))
+    (setq-local eshell-prompt-function (lambda () "P> "))
     (eshell-nix-shell-mode 1)
     (should (eq (key-binding (kbd "C-d")) #'eshell-nix-shell--ctrl-d))
-    (eshell-nix-shell--apply '("PATH=/one" "L=one") nil '("one"))
+    (eshell-nix-shell--apply '("PATH=/one" "L=one") nil '("outer"))
+    (eshell-nix-shell--apply '("PATH=/two" "L=two") nil '("inner"))
     (goto-char (point-max))
     (should (= (point) eshell-last-output-end))
-    (eshell-nix-shell--ctrl-d)
-    (should-not eshell-nix-shell--environment-stack)
-    (should (equal (getenv "L") "zero"))))
+    (let ((start (point)))
+      (eshell-nix-shell--ctrl-d)
+      (should (= (length eshell-nix-shell--environment-stack) 1))
+      (should (equal (getenv "L") "one"))
+      (should (equal (buffer-substring-no-properties start (point-max))
+                     "\n❄ nix-shell  outer\nP> ")))))
 
 (ert-deftest eshell-nix-shell-apply-is-atomic ()
   "An error during activation restores state and stack depth."
@@ -396,11 +401,18 @@
       (should-not eshell-nix-shell--environment-stack))))
 
 (ert-deftest eshell-nix-shell-integration-exit-and-nesting ()
-  "Exit pops exactly one fake environment and nesting is LIFO."
+  "Exit pops one environment and redraws the outer package indicator."
   (eshell-nix-shell-tests--with-fake
-    (eshell-nix-shell-tests--command "nix-shell --argstr layer one")
-    (eshell-nix-shell-tests--command "nix-shell --argstr layer two")
-    (eshell-nix-shell-tests--command "exit")
+    (eshell-nix-shell-tests--command
+     "nix-shell --argstr layer one -p outer")
+    (eshell-nix-shell-tests--command
+     "nix-shell --argstr layer two -p inner")
+    (goto-char (point-max))
+    (let ((start (point)))
+      (should (equal (eshell-nix-shell-tests--command "exit") ""))
+      (should (string-prefix-p
+               "exit\n❄ nix-shell  outer\n"
+               (buffer-substring-no-properties start (point-max)))))
     (should (equal (getenv "FAKE_LAYER") "one"))
     (should (= (length eshell-nix-shell--environment-stack) 1))
     (eshell-nix-shell-tests--command "nix-shell-exit")

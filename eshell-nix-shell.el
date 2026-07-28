@@ -574,7 +574,9 @@ Return the empty string when no environment is active."
   (if (and eshell-nix-shell-use-exit-advice
            (bound-and-true-p eshell-nix-shell-mode)
            eshell-nix-shell--environment-stack)
-      (eshell-nix-shell-pop)
+      (progn
+        (eshell-nix-shell-pop)
+        nil)
     (apply original arguments)))
 
 (defun eshell-nix-shell--ctrl-d ()
@@ -587,7 +589,11 @@ behavior."
            (eobp)
            (= (point) eshell-last-output-end)
            (not (eshell-head-process)))
-      (eshell-nix-shell-pop)
+      (progn
+        (eshell-nix-shell-pop)
+        ;; Submit the empty input so Eshell emits a fresh prompt using the
+        ;; restored outer environment instead of leaving the old indicator.
+        (eshell-send-input))
     ;; `minor-mode-map-alist' consults the mode variable's current value.
     (let* ((eshell-nix-shell-mode nil)
            (fallback (key-binding (kbd "C-d"))))
