@@ -103,6 +103,13 @@ The private environment and directory files remain mode 0600 and their paths
 are reported in Eshell.  Successful captures are always deleted."
   :type 'boolean)
 
+(defcustom eshell-nix-shell-process-kill-timeout 5.0
+  "Seconds to wait for a cancelled activation process to terminate.
+A process blocked in an uninterruptible system call, such as one waiting on an
+unresponsive remote connection, cannot be reaped.  Waiting forever would hang
+Emacs, so the wait is abandoned after this many seconds and reported instead."
+  :type 'number)
+
 (defcustom eshell-nix-shell-before-enter-hook nil
   "Hook run immediately before an imported environment is installed."
   :type 'hook)
@@ -123,8 +130,8 @@ are reported in Eshell.  Successful captures are always deleted."
 
 (cl-defstruct (eshell-nix-shell--frame
                (:constructor eshell-nix-shell--make-frame))
-  name process-environment path exec-path exec-path-local-p default-directory
-  remote-environment remote-path-active-p activation-arguments metadata)
+  process-environment path exec-path exec-path-local-p default-directory
+  remote-environment remote-path-active-p activation-arguments)
 
 (defvar-local eshell-nix-shell--environment-stack nil)
 (defvar-local eshell-nix-shell--pending-capture nil)
@@ -136,6 +143,15 @@ are reported in Eshell.  Successful captures are always deleted."
 (defvar-local eshell-nix-shell--remote-path-active-p nil)
 (defvar-local eshell-nix-shell--prompt-function-was-local-p nil)
 (defvar-local eshell-nix-shell--prompt-installed-p nil)
+(defvar-local eshell-nix-shell--advice-claimed-p nil)
+
+(defmacro eshell-nix-shell--setq-local-env (variable value)
+  "Set buffer-local VARIABLE to VALUE without a `lexical-binding' warning.
+VARIABLE must be a symbol naming one of the dynamic environment variables
+that Eshell rebinds, such as `process-environment' or variable `exec-path'."
+  (declare (indent 1) (debug (symbolp form)))
+  `(with-suppressed-warnings ((lexical ,variable))
+     (setq-local ,variable ,value)))
 
 (defun eshell-nix-shell--debug (format-string &rest arguments)
   "Record FORMAT-STRING with ARGUMENTS when debugging is enabled."
@@ -155,11 +171,9 @@ are reported in Eshell.  Successful captures are always deleted."
 
 (defun eshell-nix-shell--env-value (name environment)
   "Return NAME's value in ENVIRONMENT, respecting its first occurrence."
-  (let ((prefix (concat name "=")))
-    (catch 'value
-      (dolist (entry environment)
-        (when (and (stringp entry) (string-prefix-p prefix entry))
-          (throw 'value (substring entry (length prefix))))))))
+  ;; `getenv-internal' falls back to `process-environment' for a nil
+  ;; ENVIRONMENT; an empty environment must define nothing here.
+  (and environment (getenv-internal name environment)))
 
 (defun eshell-nix-shell--env-entry (name environment)
   "Return NAME's entry in ENVIRONMENT, including an unset marker."
@@ -219,10 +233,9 @@ Call ORIGINAL for variables not managed by the active Nix environment."
 
 (defun eshell-nix-shell--restore-frame (frame)
   "Restore all buffer state saved in FRAME."
-  (with-suppressed-warnings ((lexical process-environment))
-    (setq-local process-environment
-                (copy-sequence
-                 (eshell-nix-shell--frame-process-environment frame))))
+  (eshell-nix-shell--setq-local-env process-environment
+    (copy-sequence
+     (eshell-nix-shell--frame-process-environment frame)))
   (setq eshell-nix-shell--remote-environment
         (copy-sequence
          (eshell-nix-shell--frame-remote-environment frame)))
@@ -237,17 +250,14 @@ Call ORIGINAL for variables not managed by the active Nix environment."
       (eshell-set-path
        (copy-sequence (eshell-nix-shell--frame-path frame)))))
   (if (eshell-nix-shell--frame-exec-path-local-p frame)
-      (with-suppressed-warnings ((lexical exec-path))
-        (setq-local exec-path
-                    (copy-sequence
-                     (eshell-nix-shell--frame-exec-path frame))))
+      (eshell-nix-shell--setq-local-env exec-path
+        (copy-sequence (eshell-nix-shell--frame-exec-path frame)))
     (kill-local-variable 'exec-path))
   (setq default-directory (eshell-nix-shell--frame-default-directory frame)))
 
 (defun eshell-nix-shell--capture-frame (arguments)
   "Capture current buffer state in a frame labelled by ARGUMENTS."
   (eshell-nix-shell--make-frame
-   :name "nix-shell"
    :process-environment (copy-sequence process-environment)
    :path (copy-sequence (eshell-get-path t))
    :exec-path (copy-sequence exec-path)
@@ -273,16 +283,20 @@ Call ORIGINAL for variables not managed by the active Nix environment."
           (and exec-directory (list exec-directory))))
 
 (defun eshell-nix-shell--parse-nul-file (file)
-  "Read FILE literally and return its NUL-delimited records."
+  "Read FILE literally and return its NUL-delimited records.
+Environment values are arbitrary byte strings, so the file is read without any
+decoding or end-of-line conversion and each record is decoded afterwards.
+Bytes that are not valid UTF-8 survive as raw bytes."
   (with-temp-buffer
-    (set-buffer-multibyte t)
-    (let ((coding-system-for-read 'utf-8-emacs))
-      (insert-file-contents file))
+    (set-buffer-multibyte nil)
+    (insert-file-contents-literally file)
     (let ((text (buffer-string)))
       (unless (and (> (length text) 0)
                    (= (aref text (1- (length text))) 0))
         (error "Incomplete Nix shell capture"))
-      (split-string text "\0" t))))
+      (mapcar (lambda (record)
+                (decode-coding-string record 'utf-8-emacs-unix))
+              (split-string text "\0" t)))))
 
 (defun eshell-nix-shell--parse-environment (file)
   "Parse NUL-delimited environment records from FILE.
@@ -303,8 +317,12 @@ Malformed entries are retained, and duplicate names use the first record."
                           '("INSIDE_EMACS" "TERM")))
         result)
     (dolist (entry environment)
-      (let ((equals (and (stringp entry) (string-search "=" entry))))
-        (unless (and equals (member (substring entry 0 equals) excluded))
+      ;; An entry without "=" is an unset marker naming the variable itself.
+      (let ((name (and (stringp entry)
+                       (if-let* ((equals (string-search "=" entry)))
+                           (substring entry 0 equals)
+                         entry))))
+        (unless (and name (member name excluded))
           (push entry result))))
     (dolist (name '("TERM" "INSIDE_EMACS"))
       (let ((value (eshell-nix-shell--env-value name old-environment)))
@@ -324,18 +342,16 @@ Malformed entries are retained, and duplicate names use the first record."
                    environment
                    (eshell-nix-shell--frame-process-environment frame)))
                  (path (eshell-nix-shell--env-value "PATH" filtered)))
-            (with-suppressed-warnings ((lexical process-environment))
-              (setq-local
-               process-environment
-               (if (file-remote-p default-directory)
-                   ;; Tramp launches its local transport with this variable,
-                   ;; then forwards entries that differ from the top-level
-                   ;; environment.  Keep the local entries first so commands
-                   ;; such as ssh, podman, and kubectl remain launchable.
-                   (append (copy-sequence
-                            (default-toplevel-value 'process-environment))
-                           filtered)
-                 filtered)))
+            (eshell-nix-shell--setq-local-env process-environment
+              (if (file-remote-p default-directory)
+                  ;; Tramp launches its local transport with this variable,
+                  ;; then forwards entries that differ from the top-level
+                  ;; environment.  Keep the local entries first so commands
+                  ;; such as ssh, podman, and kubectl remain launchable.
+                  (append (copy-sequence
+                           (default-toplevel-value 'process-environment))
+                          filtered)
+                filtered))
             (if (file-remote-p default-directory)
                 (setq eshell-nix-shell--remote-environment
                       (seq-remove
@@ -350,8 +366,8 @@ Malformed entries are retained, and duplicate names use the first record."
                     eshell-nix-shell--remote-path nil
                     eshell-nix-shell--remote-path-active-p nil)
               (eshell-set-path (eshell-nix-shell--path-list path))
-              (with-suppressed-warnings ((lexical exec-path))
-                (setq-local exec-path (eshell-nix-shell--exec-path path)))))
+              (eshell-nix-shell--setq-local-env exec-path
+                (eshell-nix-shell--exec-path path))))
           (when eshell-nix-shell-change-directory
             (unless (and directory (file-directory-p directory))
               (error "Nix shell returned an invalid directory"))
@@ -386,11 +402,17 @@ Malformed entries are retained, and duplicate names use the first record."
   "Create private environment and directory capture files.
 On a remote Eshell, create the files on the same host as the shell."
   (let ((remote-prefix (file-remote-p default-directory))
-        (env (make-nearby-temp-file "eshell-nix-shell-env-"))
+        ;; Create the files with restrictive modes rather than tightening them
+        ;; afterwards: a umask-dependent creation mode would leave a window in
+        ;; which the environment dump is readable by other users.
+        (env (with-file-modes #o600
+               (make-nearby-temp-file "eshell-nix-shell-env-")))
         cwd)
     (unwind-protect
         (progn
-          (setq cwd (make-nearby-temp-file "eshell-nix-shell-cwd-"))
+          (setq cwd (with-file-modes #o600
+                      (make-nearby-temp-file "eshell-nix-shell-cwd-")))
+          ;; Belt and braces for back ends that ignore `with-file-modes'.
           (set-file-modes env #o600)
           (set-file-modes cwd #o600)
           (push env eshell-nix-shell--capture-files)
@@ -442,8 +464,19 @@ On a remote Eshell, create the files on the same host as the shell."
                  'eshell-nix-shell--capture nil)
     (when (process-live-p eshell-nix-shell--pending-process)
       (delete-process eshell-nix-shell--pending-process)
-      (while (process-live-p eshell-nix-shell--pending-process)
-        (accept-process-output eshell-nix-shell--pending-process 0.01))))
+      ;; A process wedged in an uninterruptible system call, for instance one
+      ;; waiting on a dead remote connection, never becomes reapable.  Give up
+      ;; after the configured deadline instead of hanging Emacs.
+      (let ((process eshell-nix-shell--pending-process)
+            (deadline (+ (float-time)
+                         (max 0 eshell-nix-shell-process-kill-timeout))))
+        (while (and (process-live-p process) (< (float-time) deadline))
+          (accept-process-output process 0.01))
+        (when (process-live-p process)
+          (eshell-nix-shell--diagnose
+           "Nix shell activation process %s did not terminate within %ss"
+           (process-name process)
+           eshell-nix-shell-process-kill-timeout)))))
   (setq eshell-nix-shell--pending-process nil
         eshell-nix-shell--pending-capture nil))
 
@@ -512,14 +545,21 @@ PROCESS may instead be a command string on synchronous platforms."
           (eshell-nix-shell--finish-capture capture success))))))
 
 (defconst eshell-nix-shell--option-arities
-  '(("--arg" . 2) ("--argstr" . 2) ("--option" . 2) ("-I" . 1)
+  '(("--arg" . 2) ("--argstr" . 2) ("--option" . 2)
+    ("-I" . 1) ("--include" . 1)
     ("-A" . 1) ("--attr" . 1) ("-E" . 1) ("--expr" . 1)
-    ("--keep" . 1) ("-j" . 1) ("--max-jobs" . 1) ("--cores" . 1)))
+    ("--keep" . 1) ("-j" . 1) ("--max-jobs" . 1) ("--cores" . 1)
+    ("--timeout" . 1) ("--max-silent-time" . 1) ("--builders" . 1)
+    ("--substituters" . 1) ("--log-format" . 1)
+    ("-o" . 1) ("--out-link" . 1) ("--add-root" . 1))
+  "Number of values consumed by each legacy `nix-shell' option.
+Options absent from this table are assumed to take no value; a missing entry
+can only misclassify an invocation whose option value happens to be one of the
+pass-through flags, such as a literal --run.")
 
 (defun eshell-nix-shell--activation-p (arguments)
   "Return non-nil when ARGUMENTS describe interactive activation."
-  (let ((args arguments) activation)
-    (setq activation t)
+  (let ((args arguments) (activation t))
     (while args
       (let* ((argument (pop args))
              (arity (cdr (assoc argument eshell-nix-shell--option-arities))))
@@ -534,12 +574,20 @@ PROCESS may instead be a command string on synchronous platforms."
         (eshell-current-subjob-p "a background job")
         (eshell-in-subcommand-p "a subcommand")))
 
+(defun eshell-nix-shell--check-context ()
+  "Signal a `user-error' when the current Eshell context is unsupported.
+This is the single choke point for the check; both the command handler and the
+deferred Lisp command call it, because the handler must reject the invocation
+before Eshell commits to a Lisp command, while the Lisp command can also be
+called directly."
+  (when-let* ((context (eshell-nix-shell--unsupported-context-p)))
+    (user-error "Nix shell activation is not supported in %s" context)))
+
 (defun eshell-nix-shell--activate (&rest arguments)
   "Start an activation using ARGUMENTS as a deferrable Lisp command."
   (when eshell-nix-shell--pending-capture
     (user-error "A Nix shell activation is already in progress"))
-  (when-let ((context (eshell-nix-shell--unsupported-context-p)))
-    (user-error "Nix shell activation is not supported in %s" context))
+  (eshell-nix-shell--check-context)
   (dolist (argument arguments)
     (when (and (stringp argument) (string-search "\0" argument))
       (user-error "Nix shell arguments may not contain NUL bytes")))
@@ -558,7 +606,17 @@ PROCESS may instead be a command string on synchronous platforms."
           (when (processp result)
             (process-put result 'eshell-nix-shell--capture capture)
             (setq eshell-nix-shell--pending-process result))
-          (throw 'eshell-external result))
+          ;; `eshell-lisp-command' catches this tag to hand its caller the
+          ;; external command's result unchanged.  The tag is an Eshell
+          ;; internal, so a release that drops it must not break activation:
+          ;; without a catch the throw signals `no-catch' and the result is
+          ;; simply returned instead.
+          (condition-case nil
+              (throw 'eshell-external result)
+            (no-catch
+             (eshell-nix-shell--debug
+              "No `eshell-external' catch in this Emacs; returning result")
+             result)))
       (error
        (setq eshell-nix-shell--pending-process nil
              eshell-nix-shell--pending-capture nil)
@@ -571,14 +629,24 @@ PROCESS may instead be a command string on synchronous platforms."
   "Handle unqualified COMMAND with ARGUMENTS when it is an activation."
   (when (and (string= command "nix-shell")
              (eshell-nix-shell--activation-p arguments))
-    (when-let ((context (eshell-nix-shell--unsupported-context-p)))
-      (user-error "Nix shell activation is not supported in %s" context))
+    (eshell-nix-shell--check-context)
     (eshell-lisp-command #'eshell-nix-shell--activate arguments)))
+
+(defun eshell-nix-shell--external-file-name (command)
+  "Return the file name Eshell would run for external COMMAND, or nil.
+Eshell's own resolver is preferred, with a public fallback for Emacs versions
+that do not provide it."
+  (cond
+   ((fboundp 'eshell-external-command--which)
+    (eshell-external-command--which command))
+   ((file-name-directory command)
+    (and (file-executable-p command) command))
+   (t (eshell-search-path command))))
 
 (defun eshell-nix-shell--which (command)
   "Describe interception of COMMAND for Eshell's `which' command."
   (when (string= command "nix-shell")
-    (let ((external (eshell-external-command--which
+    (let ((external (eshell-nix-shell--external-file-name
                      eshell-nix-shell-executable)))
       (format "%s (activation managed by eshell-nix-shell-mode)"
               (or external eshell-nix-shell-executable)))))
@@ -608,7 +676,7 @@ PROCESS may instead be a command string on synchronous platforms."
 (defun eshell-nix-shell-prompt-segment ()
   "Return a prompt segment describing the innermost active Nix shell.
 Return the empty string when no environment is active."
-  (if-let ((frame (car eshell-nix-shell--environment-stack)))
+  (if-let* ((frame (car eshell-nix-shell--environment-stack)))
       (funcall eshell-nix-shell-prompt-format-function
                (eshell-nix-shell--frame-activation-arguments frame))
     ""))
@@ -691,6 +759,80 @@ behavior."
     map)
   "Keymap for `eshell-nix-shell-mode'.")
 
+(defconst eshell-nix-shell--required-internals
+  '(eshell-external-command eshell-lisp-command eshell-get-path
+    eshell-set-path eshell-get-variable eshell-external-command--which)
+  "Eshell functions this package builds on.
+Some of them, notably `eshell-external-command--which' and the
+`eshell-external' catch used by `eshell-lisp-command', are internal to Eshell
+and may change between Emacs releases.  Missing pieces degrade gracefully, and
+`eshell-nix-shell--verify-internals' reports them once.")
+
+(defvar eshell-nix-shell--internals-verified-p nil
+  "Non-nil once the Eshell integration points have been checked.")
+
+(defun eshell-nix-shell--verify-internals ()
+  "Warn once about Eshell integration points missing from this Emacs."
+  (unless eshell-nix-shell--internals-verified-p
+    (setq eshell-nix-shell--internals-verified-p t)
+    (when-let* ((missing (seq-remove #'fboundp
+                                     eshell-nix-shell--required-internals)))
+      (display-warning
+       'eshell-nix-shell
+       (format (concat "This Emacs (%s) lacks the Eshell function(s) %s; "
+                       "eshell-nix-shell may behave unexpectedly")
+               emacs-version
+               (mapconcat #'symbol-name missing ", "))
+       :warning))))
+
+(defvar eshell-nix-shell--advice-users 0
+  "Number of buffers that currently require the global advice.")
+
+(defconst eshell-nix-shell--advice
+  '((eshell/exit . eshell-nix-shell--exit-advice)
+    (eshell-get-path . eshell-nix-shell--get-path-advice)
+    (eshell-set-path . eshell-nix-shell--set-path-advice)
+    (eshell-get-variable . eshell-nix-shell--get-variable-advice)
+    (tramp-local-environment-variable-p
+     . eshell-nix-shell--tramp-local-environment-variable-advice))
+  "Alist of globally advised functions and their `:around' advice.")
+
+(defun eshell-nix-shell--install-advice ()
+  "Install the global advice this package needs.
+Installation is deferred to the first buffer that enables the mode so that
+merely loading the library changes no behavior."
+  (eshell-nix-shell--verify-internals)
+  (pcase-dolist (`(,symbol . ,function) eshell-nix-shell--advice)
+    (advice-add symbol :around function)))
+
+(defun eshell-nix-shell--remove-advice ()
+  "Remove the global advice installed by this package."
+  (pcase-dolist (`(,symbol . ,function) eshell-nix-shell--advice)
+    (advice-remove symbol function)))
+
+(defun eshell-nix-shell--claim-advice ()
+  "Register the current buffer as a user of the global advice."
+  (unless eshell-nix-shell--advice-claimed-p
+    (setq eshell-nix-shell--advice-claimed-p t)
+    (when (<= (cl-incf eshell-nix-shell--advice-users) 1)
+      (setq eshell-nix-shell--advice-users 1)
+      (eshell-nix-shell--install-advice))))
+
+(defun eshell-nix-shell--release-advice (&optional force)
+  "Unregister the current buffer from the global advice.
+With FORCE, remove the advice regardless of the remaining users."
+  (when eshell-nix-shell--advice-claimed-p
+    (setq eshell-nix-shell--advice-claimed-p nil)
+    (cl-decf eshell-nix-shell--advice-users))
+  (when (or force (<= eshell-nix-shell--advice-users 0))
+    (setq eshell-nix-shell--advice-users 0)
+    (eshell-nix-shell--remove-advice)))
+
+(defun eshell-nix-shell--kill-buffer-hook ()
+  "Release global integration and captures owned by a dying buffer."
+  (eshell-nix-shell--cleanup-all)
+  (eshell-nix-shell--release-advice))
+
 (defun eshell-nix-shell--disable (&optional force)
   "Remove local integration and restore frames; FORCE cancels activation."
   (when (and eshell-nix-shell--pending-capture (not force))
@@ -709,9 +851,10 @@ behavior."
       (remove-hook 'eshell-named-command-hook
                    #'eshell-nix-shell--command-handler t)
       (remove-hook 'eshell-kill-hook #'eshell-nix-shell--kill-hook t)
-      (remove-hook 'kill-buffer-hook #'eshell-nix-shell--cleanup-all t)
+      (remove-hook 'kill-buffer-hook #'eshell-nix-shell--kill-buffer-hook t)
       (eshell-nix-shell--remove-prompt)
-      (eshell-nix-shell--cleanup-all))
+      (eshell-nix-shell--cleanup-all)
+      (eshell-nix-shell--release-advice))
     (when (and first-error (not force))
       (signal (car first-error) (cdr first-error)))))
 
@@ -726,10 +869,14 @@ order.  It refuses to disable while activation is in progress."
         (unless (derived-mode-p 'eshell-mode)
           (setq eshell-nix-shell-mode nil)
           (user-error "Eshell Nix Shell mode only works in Eshell buffers"))
+        (eshell-nix-shell--claim-advice)
         (add-hook 'eshell-named-command-hook
                   #'eshell-nix-shell--command-handler nil t)
+        ;; Depth -90 keeps the import ahead of user hooks that inspect the
+        ;; environment after a command, while still leaving room for a hook
+        ;; that must observe the pre-import state at a lower depth.
         (add-hook 'eshell-kill-hook #'eshell-nix-shell--kill-hook -90 t)
-        (add-hook 'kill-buffer-hook #'eshell-nix-shell--cleanup-all nil t)
+        (add-hook 'kill-buffer-hook #'eshell-nix-shell--kill-buffer-hook nil t)
         (eshell-nix-shell--install-prompt))
     (eshell-nix-shell--disable)))
 
@@ -742,7 +889,9 @@ order.  It refuses to disable while activation is in progress."
   "Complete legacy `nix-shell' options and Nix expression file names.
 Package-name completion is an intentionally reserved extension point."
   (while (pcomplete-here* eshell-nix-shell--completion-options)
-    (let ((previous (pcomplete-arg -1)))
+    ;; `pcomplete-arg' subtracts its index, so the option just consumed is at
+    ;; index 1; a negative index would look ahead instead.
+    (let ((previous (pcomplete-arg 1)))
       (cond
        ((member previous '("-A" "--attr" "-E" "--expr" "--keep" "-j"
                            "--max-jobs" "--cores"))
@@ -753,15 +902,7 @@ Package-name completion is an intentionally reserved extension point."
        (t (pcomplete-here (pcomplete-entries nil (lambda (file)
                                                    (string-suffix-p ".nix" file)))))))))
 
-(advice-add 'eshell/exit :around #'eshell-nix-shell--exit-advice)
-(advice-add 'eshell-get-path :around #'eshell-nix-shell--get-path-advice)
-(advice-add 'eshell-set-path :around #'eshell-nix-shell--set-path-advice)
-(advice-add 'eshell-get-variable :around
-            #'eshell-nix-shell--get-variable-advice)
-
 (autoload 'tramp-local-environment-variable-p "tramp")
-(advice-add 'tramp-local-environment-variable-p :around
-            #'eshell-nix-shell--tramp-local-environment-variable-advice)
 
 (defun eshell-nix-shell-unload-function ()
   "Restore managed Eshell buffers and remove global integration."
@@ -772,15 +913,7 @@ Package-name completion is an intentionally reserved extension point."
                 eshell-nix-shell--pending-capture)
         (setq eshell-nix-shell-mode nil)
         (eshell-nix-shell--disable t))))
-  (advice-remove 'eshell/exit #'eshell-nix-shell--exit-advice)
-  (advice-remove 'eshell-get-path #'eshell-nix-shell--get-path-advice)
-  (advice-remove 'eshell-set-path #'eshell-nix-shell--set-path-advice)
-  (advice-remove 'eshell-get-variable
-                 #'eshell-nix-shell--get-variable-advice)
-  (when (fboundp 'tramp-local-environment-variable-p)
-    (advice-remove
-     'tramp-local-environment-variable-p
-     #'eshell-nix-shell--tramp-local-environment-variable-advice))
+  (eshell-nix-shell--release-advice t)
   nil)
 
 (provide 'eshell-nix-shell)

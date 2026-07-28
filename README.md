@@ -100,9 +100,17 @@ Directory changes made by `shellHook` are ignored by default. To apply them:
 - `eshell-nix-shell-executable` selects the executable to launch.
 - `eshell-nix-shell-excluded-variables` controls which variables are not
   imported.
+- `eshell-nix-shell-process-kill-timeout` bounds the wait for a cancelled
+  activation process that refuses to die, for instance one blocked on an
+  unresponsive remote connection.
 
 The intercepted Eshell command remains named `nix-shell`, regardless of the
 configured executable.
+
+Loading the library has no effect on its own: the advice this package needs on
+`eshell/exit`, Eshell's path and variable accessors, and TRAMP is installed
+when the first buffer enables `eshell-nix-shell-mode` and removed when the last
+one disables it.
 
 ## TRAMP
 

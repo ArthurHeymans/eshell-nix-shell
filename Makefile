@@ -8,9 +8,10 @@ compile:
 	  --eval '(setq byte-compile-error-on-warn t)' \
 	  -f batch-byte-compile eshell-nix-shell.el eshell-nix-shell-tests.el
 
+# `checkdoc-file' only prints; inspect its warning buffer so the target fails.
 checkdoc:
 	$(EMACS) -Q --batch -L . \
-	  --eval '(progn (require (quote checkdoc)) (checkdoc-file "eshell-nix-shell.el"))'
+	  --eval '(progn (require (quote checkdoc)) (dolist (file (list "eshell-nix-shell.el" "eshell-nix-shell-tests.el")) (checkdoc-file file)) (let ((buffer (get-buffer "*Warnings*"))) (if (and buffer (> (buffer-size buffer) 0)) (progn (princ (with-current-buffer buffer (buffer-string))) (kill-emacs 1)) (message "checkdoc: no warnings"))))'
 
 package-lint:
 	$(EMACS) -Q --batch -L . \

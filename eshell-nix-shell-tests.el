@@ -33,12 +33,11 @@
 (require 'ert-x)
 (require 'eshell)
 (require 'esh-mode)
+;; These modules own the persistence variables neutralized by the fixture.
+(require 'em-alias)
+(require 'em-dirs)
+(require 'em-hist)
 (require 'eshell-nix-shell)
-
-(defvar eshell-aliases-file nil)
-(defvar eshell-command-aliases-list nil)
-(defvar eshell-history-file-name nil)
-(defvar eshell-last-dir-ring-file-name nil)
 
 (defconst eshell-nix-shell-tests--directory
   (file-name-directory (or load-file-name buffer-file-name))
@@ -82,6 +81,30 @@
   (buffer-substring-no-properties (eshell-beginning-of-output)
                                   (eshell-end-of-output)))
 
+(defmacro eshell-nix-shell-tests--with-advice (&rest body)
+  "Run BODY with this package's global advice temporarily installed.
+The advice is installed on demand by the minor mode, so tests that exercise
+advised functions without an enabled mode must claim it themselves."
+  (declare (indent 0) (debug t))
+  `(unwind-protect
+       (progn (eshell-nix-shell--claim-advice) ,@body)
+     (eshell-nix-shell--release-advice)))
+
+(defun eshell-nix-shell-tests--completions (input)
+  "Return the completion candidates offered for INPUT at the Eshell prompt."
+  (goto-char eshell-last-output-end)
+  (delete-region (point) (point-max))
+  (unwind-protect
+      (progn
+        (insert-and-inherit input)
+        (let ((data (run-hook-with-args-until-success
+                     'completion-at-point-functions)))
+          (and data
+               (all-completions
+                (buffer-substring-no-properties (nth 0 data) (nth 1 data))
+                (nth 2 data)))))
+    (delete-region eshell-last-output-end (point-max))))
+
 (defun eshell-nix-shell-tests--write-nul (records)
   "Write RECORDS, NUL terminated, and return the temporary file name."
   (let ((file (make-temp-file "ens-test-")))
@@ -99,6 +122,22 @@
         (should (equal (eshell-nix-shell--parse-environment file)
                        '("A=first" "MALFORMED" "EMPTY="
                          "UNICODE=λ" "LINES=one\ntwo")))
+      (delete-file file))))
+
+(ert-deftest eshell-nix-shell-parse-preserves-raw-bytes-and-crlf ()
+  "Capture parsing performs no end-of-line or coding conversion."
+  (let ((file (make-temp-file "ens-test-")))
+    (unwind-protect
+        (progn
+          (with-temp-file file
+            (set-buffer-multibyte nil)
+            (let ((coding-system-for-write 'no-conversion))
+              (insert "CRLF=one\r\ntwo\0" "RAW=\xff\xfe\0")))
+          (let ((records (eshell-nix-shell--parse-environment file)))
+            (should (equal (car records) "CRLF=one\r\ntwo"))
+            (should (equal (nth 1 records)
+                           (decode-coding-string "RAW=\xff\xfe"
+                                                 'utf-8-emacs-unix)))))
       (delete-file file))))
 
 (ert-deftest eshell-nix-shell-parse-rejects-incomplete-data ()
@@ -125,10 +164,14 @@
                     '("OK=yes" "PS1=bad" "TMPDIR=/gone" "TERM=bad"
                       "INSIDE_EMACS=bad")
                     '("TERM=parent" "INSIDE_EMACS=30.2"))
-                   '("OK=yes" "TERM=parent" "INSIDE_EMACS=30.2")))))
+                   '("OK=yes" "TERM=parent" "INSIDE_EMACS=30.2")))
+    ;; An entry without "=" is an unset marker and is denied by name too.
+    (should (equal (eshell-nix-shell--filter-environment
+                    '("PS1" "KEPT" "OK=yes") nil)
+                   '("KEPT" "OK=yes")))))
 
 (ert-deftest eshell-nix-shell-frame-restore-and-locality ()
-  "A frame restores all values, including non-local `exec-path'."
+  "A frame restores all values, including a non-local variable `exec-path'."
   (eshell-nix-shell-tests--with-eshell
     (kill-local-variable 'exec-path)
     (let ((original-exec exec-path)
@@ -190,7 +233,7 @@
     (setq-local exec-path '("/before"))
     (eshell-set-path '("/before"))
     (let ((eshell-nix-shell-after-enter-hook
-           (list (lambda () (error "synthetic failure")))))
+           (list (lambda () (error "Synthetic failure")))))
       (should-error (eshell-nix-shell--apply
                      '("PATH=/after" "X=after") nil nil)))
     (should-not eshell-nix-shell--environment-stack)
@@ -215,11 +258,35 @@
     (should (equal (getenv "X") "before"))
     (should (equal exec-path '("/before")))))
 
+(ert-deftest eshell-nix-shell-apply-rejects-invalid-directory ()
+  "An opt-in directory change to a missing directory rolls everything back."
+  (eshell-nix-shell-tests--with-eshell
+    (setq-local process-environment '("PATH=/before" "X=before"))
+    (setq-local exec-path '("/before"))
+    (eshell-set-path '("/before"))
+    (let ((eshell-nix-shell-change-directory t)
+          (start default-directory)
+          (missing (expand-file-name "ens-missing-directory"
+                                     temporary-file-directory)))
+      (should-not (file-exists-p missing))
+      (should-error (eshell-nix-shell--apply '("PATH=/after" "X=after")
+                                             missing nil))
+      (should (equal default-directory start))
+      ;; A nil directory is equally invalid when the option is enabled.
+      (should-error (eshell-nix-shell--apply '("PATH=/after") nil nil)))
+    (should-not eshell-nix-shell--environment-stack)
+    (should (equal (getenv "X") "before"))
+    (should (equal exec-path '("/before")))
+    (should (equal (eshell-get-path t) '("/before")))))
+
 (ert-deftest eshell-nix-shell-command-classification ()
   "Activation classification observes option arities."
   (dolist (args '(() ("thing.nix") ("-p" "hello")
                      ("--argstr" "msg" "--run")
-                     ("-I" "--run") ("--unknown")))
+                     ("-I" "--run") ("--unknown")
+                     ("--timeout" "--run") ("--builders" "--run")
+                     ("--max-silent-time" "--run") ("--out-link" "--run")
+                     ("-o" "--run") ("--include" "--run")))
     (should (eshell-nix-shell--activation-p args)))
   (dolist (args '(("--run" "echo x") ("--command" "echo x")
                   ("--help") ("-h") ("--version")))
@@ -307,14 +374,15 @@
         (process-environment '("ENS_COLLISION=local" "ENS_COLLISION=remote"))
         (eshell-variable-aliases-list nil)
         (eshell-nix-shell--remote-environment '("ENS_COLLISION=remote")))
-    (should (equal (eshell-get-variable "ENS_COLLISION") "remote"))))
+    (eshell-nix-shell-tests--with-advice
+      (should (equal (eshell-get-variable "ENS_COLLISION") "remote")))))
 
 (ert-deftest eshell-nix-shell-remote-path-is-buffer-local ()
   "Managed PATH values do not leak between Eshell buffers on one connection."
   (let ((first (generate-new-buffer " *ens-remote-first*"))
         (second (generate-new-buffer " *ens-remote-second*")))
     (unwind-protect
-        (progn
+        (eshell-nix-shell-tests--with-advice
           (with-current-buffer first
             (setq default-directory "/ssh:host:/tmp/"
                   eshell-nix-shell--remote-path-active-p t
@@ -329,6 +397,53 @@
             (should (equal (eshell-get-path t) '("/nix/first")))))
       (kill-buffer first)
       (kill-buffer second))))
+
+(ert-deftest eshell-nix-shell-get-path-advice-honors-literal-p ()
+  "The managed remote path is literal or Tramp-prefixed as requested."
+  (with-temp-buffer
+    (setq default-directory "/ssh:host:/tmp/"
+          eshell-nix-shell--remote-path-active-p t
+          eshell-nix-shell--remote-path '("/nix/bin" "/usr/bin"))
+    (should (equal (eshell-nix-shell--get-path-advice #'ignore t)
+                   '("/nix/bin" "/usr/bin")))
+    (should (equal (eshell-nix-shell--get-path-advice #'ignore nil)
+                   '("/ssh:host:/nix/bin" "/ssh:host:/usr/bin")))
+    ;; Without an active managed path the original function decides.
+    (setq eshell-nix-shell--remote-path-active-p nil)
+    (should (equal (eshell-nix-shell--get-path-advice
+                    (lambda (_literal) '("/fallback")) t)
+                   '("/fallback")))))
+
+(ert-deftest eshell-nix-shell-which-annotates-resolved-executable ()
+  "Command description reports the resolved executable and the annotation."
+  (let ((eshell-nix-shell-executable "nix-shell"))
+    (cl-letf (((symbol-function 'eshell-nix-shell--external-file-name)
+               (lambda (_command) "/usr/bin/nix-shell")))
+      (should (equal (eshell-nix-shell--which "nix-shell")
+                     (concat "/usr/bin/nix-shell"
+                             " (activation managed by eshell-nix-shell-mode)")))
+      (should-not (eshell-nix-shell--which "nix-build")))
+    ;; An unresolvable command still describes the configured name.
+    (cl-letf (((symbol-function 'eshell-nix-shell--external-file-name)
+               (lambda (_command) nil)))
+      (should (string-prefix-p "nix-shell (activation managed"
+                               (eshell-nix-shell--which "nix-shell"))))))
+
+(ert-deftest eshell-nix-shell-external-file-name-has-public-fallback ()
+  "Resolution works even without Eshell's internal `which' helper."
+  (ert-with-temp-directory root
+    (let ((program (expand-file-name "ens-fake-shell" root)))
+      (with-temp-file program (insert "#!/bin/sh\n"))
+      (set-file-modes program #o700)
+      (cl-letf (((symbol-function 'eshell-external-command--which) nil))
+        (should (equal (eshell-nix-shell--external-file-name program)
+                       program))
+        (should-not (eshell-nix-shell--external-file-name
+                     (expand-file-name "missing" root)))
+        (let ((eshell-path-env-list (list root)))
+          (should (equal (eshell-nix-shell--external-file-name
+                          "ens-fake-shell")
+                         program)))))))
 
 (ert-deftest eshell-nix-shell-default-prompt-omits-package-option ()
   "The default package prompt emphasizes package names, not `-p'."
@@ -569,7 +684,7 @@
     (eshell-nix-shell-mode 1)
     (eshell-nix-shell--apply '("PATH=/after" "X=after") nil nil)
     (let ((eshell-nix-shell-before-exit-hook
-           (list (lambda () (error "exit hook failed")))))
+           (list (lambda () (error "Exit hook failed")))))
       (should-error (eshell-nix-shell-mode -1)))
     (should-not eshell-nix-shell--environment-stack)
     (should (equal (getenv "X") "before"))
@@ -594,6 +709,125 @@
       (should-not (process-live-p process))
       (should-not (file-exists-p environment-file))
       (should-not (file-exists-p directory-file)))))
+
+(ert-deftest eshell-nix-shell-cancel-pending-gives-up-on-unreapable-process ()
+  "Cancellation abandons a process that never dies instead of hanging."
+  (eshell-nix-shell-tests--with-eshell
+    (let ((process (make-process :name "ens-immortal-test" :buffer nil
+                                 :command '("/bin/sh" "-c" "exit 0")))
+          (eshell-nix-shell-process-kill-timeout 0.1)
+          (diagnostics nil))
+      (setq eshell-nix-shell--pending-process process
+            eshell-nix-shell--pending-capture '(:synthetic t))
+      (cl-letf (((symbol-function 'process-live-p) (lambda (_process) t))
+                ((symbol-function 'delete-process) #'ignore)
+                ((symbol-function 'eshell-nix-shell--diagnose)
+                 (lambda (format-string &rest arguments)
+                   (push (apply #'format format-string arguments)
+                         diagnostics))))
+        (let ((start (float-time)))
+          (eshell-nix-shell--cancel-pending)
+          (should (< (- (float-time) start) 5))))
+      (should (string-match-p "did not terminate" (car diagnostics)))
+      (should-not eshell-nix-shell--pending-process)
+      (should-not eshell-nix-shell--pending-capture)
+      (when (process-live-p process) (delete-process process)))))
+
+(ert-deftest eshell-nix-shell-advice-follows-mode-lifetime ()
+  "Loading installs no advice; the mode installs and removes it."
+  (should (= eshell-nix-shell--advice-users 0))
+  (dolist (entry eshell-nix-shell--advice)
+    (should-not (advice-member-p (cdr entry) (car entry))))
+  (eshell-nix-shell-tests--with-eshell
+    (eshell-nix-shell-mode 1)
+    (dolist (entry eshell-nix-shell--advice)
+      (should (advice-member-p (cdr entry) (car entry))))
+    ;; A second user keeps the advice installed after the first releases it.
+    (eshell-nix-shell-tests--with-eshell
+      (eshell-nix-shell-mode 1)
+      (should (= eshell-nix-shell--advice-users 2))
+      (eshell-nix-shell-mode -1))
+    (should (= eshell-nix-shell--advice-users 1))
+    (should (advice-member-p #'eshell-nix-shell--exit-advice 'eshell/exit))
+    (eshell-nix-shell-mode -1))
+  (should (= eshell-nix-shell--advice-users 0))
+  (dolist (entry eshell-nix-shell--advice)
+    (should-not (advice-member-p (cdr entry) (car entry)))))
+
+(ert-deftest eshell-nix-shell-unload-function-restores-everything ()
+  "Unloading pops environments, disables buffers, and removes advice."
+  (eshell-nix-shell-tests--with-eshell
+    (setq-local process-environment '("PATH=/before" "X=before"))
+    (eshell-set-path '("/before"))
+    (eshell-nix-shell-mode 1)
+    (eshell-nix-shell--apply '("PATH=/after" "X=after") nil '("-p" "hello"))
+    (should (equal (eshell-nix-shell-unload-function) nil))
+    (should-not eshell-nix-shell-mode)
+    (should-not eshell-nix-shell--environment-stack)
+    (should (equal (getenv "X") "before"))
+    (should-not (memq #'eshell-nix-shell--command-handler
+                      eshell-named-command-hook))
+    (should (= eshell-nix-shell--advice-users 0))
+    (dolist (entry eshell-nix-shell--advice)
+      (should-not (advice-member-p (cdr entry) (car entry))))))
+
+(ert-deftest eshell-nix-shell-completion-offers-options-and-expressions ()
+  "Completion proposes legacy options, Nix files, and option values."
+  (eshell-nix-shell-tests--with-eshell
+    (ert-with-temp-directory root
+      (with-temp-file (expand-file-name "shell.nix" root) (insert "{}\n"))
+      (with-temp-file (expand-file-name "notes.txt" root) (insert "x\n"))
+      (setq default-directory (file-name-as-directory root))
+      (eshell-nix-shell-mode 1)
+      ;; The first argument completes to legacy option names.
+      (should (member "--pure"
+                      (eshell-nix-shell-tests--completions "nix-shell --pu")))
+      (should (member "--packages"
+                      (eshell-nix-shell-tests--completions "nix-shell ")))
+      ;; A value position offers Nix expressions only.
+      (let ((entries (eshell-nix-shell-tests--completions "nix-shell --pure ")))
+        (should (member "shell.nix" entries))
+        (should-not (member "notes.txt" entries)))
+      ;; After -I any file name is a legitimate search-path entry.
+      (should (member "notes.txt"
+                      (eshell-nix-shell-tests--completions "nix-shell -I "))))))
+
+(ert-deftest eshell-nix-shell-integration-debug-retains-failed-capture ()
+  "Debugging plus retention keeps a real failed capture and reports it."
+  (eshell-nix-shell-tests--with-fake
+    (let ((eshell-nix-shell-debug t)
+          (eshell-nix-shell-keep-capture-files-on-error t)
+          (original (symbol-function 'eshell-nix-shell--make-capture))
+          files)
+      (when-let* ((buffer (get-buffer "*eshell-nix-shell-debug*")))
+        (kill-buffer buffer))
+      (unwind-protect
+          (progn
+            (cl-letf (((symbol-function 'eshell-nix-shell--make-capture)
+                       (lambda ()
+                         (let ((capture (funcall original)))
+                           (setq files
+                                 (list (plist-get capture :environment-file)
+                                       (plist-get capture :directory-file)))
+                           capture))))
+              (let ((output (eshell-nix-shell-tests--command
+                             "nix-shell --fail")))
+                (should (string-match-p "retained" output))
+                (dolist (file files)
+                  (should (string-match-p (regexp-quote file) output)))))
+            (should (= (length files) 2))
+            (should (seq-every-p #'file-exists-p files))
+            (dolist (file files)
+              (should (equal (file-modes file) #o600)))
+            (should-not (seq-intersection files
+                                          eshell-nix-shell--capture-files))
+            (should-not eshell-nix-shell--environment-stack)
+            (with-current-buffer "*eshell-nix-shell-debug*"
+              (should (string-match-p "Starting activation" (buffer-string)))
+              (should-not (string-match-p "FAKE_LAYER" (buffer-string)))))
+        (mapc (lambda (file) (ignore-errors (delete-file file))) files)
+        (when-let* ((buffer (get-buffer "*eshell-nix-shell-debug*")))
+          (kill-buffer buffer))))))
 
 (ert-deftest eshell-nix-shell-integration-disable-removes-behavior ()
   "Disabling restores active state and stops command interception."
@@ -693,7 +927,7 @@
                    (eshell-nix-shell--path-list (getenv "PATH"))))))))
 
 (ert-deftest eshell-nix-shell-nix-shell-hook-output-and-directory ()
-  "shellHook output is visible and its directory capture is uncorrupted."
+  "A shellHook's output is visible and its directory capture is uncorrupted."
   (skip-unless (executable-find "nix-shell"))
   (let ((nixpkgs (eshell-nix-shell-tests--offline-nixpkgs)))
     (skip-unless (and nixpkgs (file-directory-p nixpkgs)))
