@@ -30,3 +30,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Make disabling and unloading restore buffers reliably despite hook errors.
 - Report the actual external path from `which nix-shell` and simplify package
   prompts to emphasize names after `-p`/`--packages`.
+- Leave a nil `eshell-prompt-function` untouched instead of installing a
+  wrapper that would fail on every prompt.
+- Keep `eshell-life-is-too-much` as Eshell's unmodified generic kill-or-bury
+  entry point; interactive `C-d` deactivation remains in the minor-mode keymap.
+- Let `make all` skip `package-lint` cleanly when it is not installed.

@@ -142,22 +142,10 @@
     (eshell-nix-shell-pop)
     (should (equal (getenv "L") "zero"))))
 
-(ert-deftest eshell-nix-shell-eof-pops-before-closing-eshell ()
-  "End-of-file pops an active environment before closing Eshell."
-  (eshell-nix-shell-tests--with-eshell
-    (setq-local process-environment '("PATH=/zero" "L=zero"))
-    (eshell-set-path '("/zero"))
-    (eshell-nix-shell-mode 1)
-    (eshell-nix-shell--apply '("PATH=/one" "L=one") nil '("one"))
-    (let (original-called)
-      (eshell-nix-shell--eof-advice
-       (lambda (&rest _) (setq original-called t)))
-      (should-not original-called)
-      (should-not eshell-nix-shell--environment-stack)
-      (should (equal (getenv "L") "zero"))
-      (eshell-nix-shell--eof-advice
-       (lambda (&rest _) (setq original-called t)))
-      (should original-called))))
+(ert-deftest eshell-nix-shell-does-not-advise-generic-eshell-disposal ()
+  "The generic Eshell kill-or-bury entry point remains unmodified."
+  (should-not
+   (advice--p (advice--symbol-function 'eshell-life-is-too-much))))
 
 (ert-deftest eshell-nix-shell-ctrl-d-key-pops-at-empty-prompt ()
   "The minor-mode keymap handles `C-d' before custom Eshell bindings."
@@ -247,6 +235,16 @@
                      "\n❄ nix-shell  hello\nproject λ "))
       (eshell-nix-shell-mode -1)
       (should (eq eshell-prompt-function custom-prompt)))))
+
+(ert-deftest eshell-nix-shell-prompt-leaves-nil-configuration-alone ()
+  "Prompt integration does not replace a nil `eshell-prompt-function'."
+  (eshell-nix-shell-tests--with-eshell
+    (setq-local eshell-prompt-function nil)
+    (eshell-nix-shell-mode 1)
+    (should-not eshell-prompt-function)
+    (should-not eshell-nix-shell--prompt-installed-p)
+    (eshell-nix-shell-mode -1)
+    (should-not eshell-prompt-function)))
 
 (defmacro eshell-nix-shell-tests--with-fake (&rest body)
   "Run BODY in Eshell with a fake `nix-shell' and introduced command."

@@ -435,6 +435,13 @@ Requirements:
   evaluating the rest of the form. This is a deliberate divergence and must be
   documented, not discovered.
 - Provide `eshell/nix-shell-exit` independently of the advice.
+- Bind `C-d` in the buffer-local minor-mode keymap. At an empty prompt with an
+  active frame it pops one layer; otherwise it dynamically disables the mode
+  while resolving the underlying binding, preserving custom delete-or-exit
+  commands.
+- Do not advise `eshell-life-is-too-much`: it is a generic kill-or-bury entry
+  point, not an EOF-specific hook, so advising it would change programmatic and
+  interactive buffer disposal.
 - Test repeated activation/deactivation and final Eshell exit.
 
 If advice proves behaviorally awkward, use a named-command hook scoped to
@@ -442,23 +449,31 @@ Eshell buffers instead. Do not globally redefine `eshell/exit`.
 
 ### 4.8 Prompt integration
 
-Expose, but do not force, a function returning the current environment label:
+Expose a function returning the current environment label:
 
 ```elisp
 (eshell-nix-shell-prompt-segment)
 ```
 
-Default label examples:
+The default formatter uses a Starship-style label, for example:
 
 ```text
-[nix-shell]
-[nix-shell: hello jq]
-[nix develop: .#default]
+❄ nix-shell
+❄ nix-shell  hello jq
 ```
 
-Keep prompt modification opt-in or minimally invasive. Users often have custom
-Eshell prompts. The package should provide data and a sample integration rather
-than replacing `eshell-prompt-function` wholesale.
+Automatic integration defaults on. When the mode is enabled and
+`eshell-prompt-function` is non-nil, save the existing function and install a
+buffer-local wrapper that prepends the Nix segment on its own line. Restore the
+saved function when disabling the mode, but do not overwrite a replacement
+installed later by another package. A nil prompt function is a legal "emit no
+prompt" configuration and must be left untouched. The integration option is
+consulted only when enabling the mode; users must toggle the mode after changing
+it in an existing buffer.
+
+Users can disable automatic integration and call
+`eshell-nix-shell-prompt-segment` from a custom prompt instead. This keeps the
+prompt data API independent of the built-in wrapper.
 
 ### 4.9 Completion
 
@@ -483,6 +498,7 @@ eshell-nix-shell-use-exit-advice
 eshell-nix-shell-change-directory
 eshell-nix-shell-excluded-variables
 eshell-nix-shell-prompt-format-function
+eshell-nix-shell-integrate-prompt
 eshell-nix-shell-keep-capture-files-on-error
 ```
 
@@ -843,6 +859,13 @@ The release is ready when all of the following hold:
    the normal per-process property: an unrelated process finishing in the same
    buffer while activation is pending could trigger the import. Record this as
    a compatibility limitation rather than duplicate Eshell lifecycle logic.
+10. **Prompt integration.** Default to a Starship-style buffer-local wrapper
+    that preserves and restores a non-nil custom prompt function. Keep the
+    segment API available for users who disable automatic integration, and
+    leave a nil prompt function untouched.
+11. **End-of-file handling.** Use the minor-mode `C-d` binding for interactive
+    EOF behavior. Do not advise `eshell-life-is-too-much`, because callers also
+    use it as the generic kill-or-bury operation.
 
 ### Still open
 

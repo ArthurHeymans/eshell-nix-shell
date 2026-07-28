@@ -76,7 +76,8 @@ It receives the activation arguments and returns a string."
   "Whether the mode should prepend its segment to the existing prompt.
 The existing `eshell-prompt-function' remains responsible for the main prompt;
 the Nix indicator is added on a separate line and disappears at stack depth
-zero."
+zero.  This option is consulted when the mode is enabled; toggle the mode after
+changing it in an existing Eshell buffer."
   :type 'boolean)
 
 (defcustom eshell-nix-shell-keep-capture-files-on-error nil
@@ -505,6 +506,7 @@ Return the empty string when no environment is active."
   (with-suppressed-warnings ((free-vars eshell-prompt-function)
                              (lexical eshell-prompt-function))
     (when (and eshell-nix-shell-integrate-prompt
+               eshell-prompt-function
                (not eshell-nix-shell--prompt-installed-p))
       (setq eshell-nix-shell--saved-prompt-function eshell-prompt-function
             eshell-nix-shell--prompt-function-was-local-p
@@ -518,27 +520,19 @@ Return the empty string when no environment is active."
   (with-suppressed-warnings ((free-vars eshell-prompt-function)
                              (lexical eshell-prompt-function))
     (when eshell-nix-shell--prompt-installed-p
-      (when (eq eshell-prompt-function #'eshell-nix-shell--prompt-function)
-        (if eshell-nix-shell--prompt-function-was-local-p
-            (setq-local eshell-prompt-function
-                        eshell-nix-shell--saved-prompt-function)
-          (kill-local-variable 'eshell-prompt-function)))
+      (if (eq eshell-prompt-function #'eshell-nix-shell--prompt-function)
+          (if eshell-nix-shell--prompt-function-was-local-p
+              (setq-local eshell-prompt-function
+                          eshell-nix-shell--saved-prompt-function)
+            (kill-local-variable 'eshell-prompt-function))
+        (eshell-nix-shell--debug
+         "Prompt wrapper changed by another package; not restoring saved prompt"))
       (setq eshell-nix-shell--saved-prompt-function nil
             eshell-nix-shell--prompt-function-was-local-p nil
             eshell-nix-shell--prompt-installed-p nil))))
 
 (defun eshell-nix-shell--exit-advice (original &rest arguments)
   "Call ORIGINAL with ARGUMENTS, or pop the active environment."
-  (if (and eshell-nix-shell-use-exit-advice
-           (bound-and-true-p eshell-nix-shell-mode)
-           eshell-nix-shell--environment-stack)
-      (eshell-nix-shell-pop)
-    (apply original arguments)))
-
-(defun eshell-nix-shell--eof-advice (original &rest arguments)
-  "Call ORIGINAL with ARGUMENTS, or pop the active environment.
-This advises `eshell-life-is-too-much', which is reached by Eshell's standard
-end-of-file command and by common Eshell configurations that bind `C-d'."
   (if (and eshell-nix-shell-use-exit-advice
            (bound-and-true-p eshell-nix-shell-mode)
            eshell-nix-shell--environment-stack)
@@ -556,6 +550,7 @@ behavior."
            (= (point) eshell-last-output-end)
            (not (eshell-head-process)))
       (eshell-nix-shell-pop)
+    ;; `minor-mode-map-alist' consults the mode variable's current value.
     (let* ((eshell-nix-shell-mode nil)
            (fallback (key-binding (kbd "C-d"))))
       (unless (commandp fallback)
@@ -631,7 +626,6 @@ Package-name completion is an intentionally reserved extension point."
                                                    (string-suffix-p ".nix" file)))))))))
 
 (advice-add 'eshell/exit :around #'eshell-nix-shell--exit-advice)
-(advice-add 'eshell-life-is-too-much :around #'eshell-nix-shell--eof-advice)
 
 (defun eshell-nix-shell-unload-function ()
   "Restore managed Eshell buffers and remove global integration."
@@ -643,7 +637,6 @@ Package-name completion is an intentionally reserved extension point."
         (setq eshell-nix-shell-mode nil)
         (eshell-nix-shell--disable t))))
   (advice-remove 'eshell/exit #'eshell-nix-shell--exit-advice)
-  (advice-remove 'eshell-life-is-too-much #'eshell-nix-shell--eof-advice)
   nil)
 
 (provide 'eshell-nix-shell)

@@ -54,7 +54,9 @@ intercepted Eshell command name intentionally remains the unqualified
 By default the mode prepends a Starship-style Nix indicator on its own line
 while preserving the existing `eshell-prompt-function`. Set
 `eshell-nix-shell-integrate-prompt` to nil to disable automatic integration.
-Custom prompts can instead call `(eshell-nix-shell-prompt-segment)` directly.
+This option is read when the mode is enabled, so toggle the mode after changing
+it in an existing Eshell buffer. Custom prompts can instead call
+`(eshell-nix-shell-prompt-segment)` directly.
 Customize `eshell-nix-shell-prompt-format-function` or the
 `eshell-nix-shell-prompt` face to change its appearance.
 
@@ -102,6 +104,9 @@ For development, run:
 ```sh
 make clean && make all
 ```
+
+The `package-lint` step runs when that package is installed and otherwise skips
+cleanly; the Nix flake check provides the reproducible full lint environment.
 
 ## Related approaches
 

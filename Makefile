@@ -1,7 +1,4 @@
 EMACS ?= emacs
-ELISP = eshell-nix-shell.el
-TESTS = eshell-nix-shell-tests.el
-
 .PHONY: all compile checkdoc package-lint test clean
 
 all: compile checkdoc package-lint test
@@ -9,19 +6,20 @@ all: compile checkdoc package-lint test
 compile:
 	$(EMACS) -Q --batch -L . \
 	  --eval '(setq byte-compile-error-on-warn t)' \
-	  -f batch-byte-compile $(ELISP) $(TESTS)
+	  -f batch-byte-compile eshell-nix-shell.el eshell-nix-shell-tests.el
 
 checkdoc:
 	$(EMACS) -Q --batch -L . \
-	  --eval '(progn (require (quote checkdoc)) (checkdoc-file "$(ELISP)"))'
+	  --eval '(progn (require (quote checkdoc)) (checkdoc-file "eshell-nix-shell.el"))'
 
 package-lint:
-	$(EMACS) -Q --batch -L . -l package-lint \
-	  --eval '(package-lint-batch-and-exit)' $(ELISP)
+	$(EMACS) -Q --batch -L . \
+	  --eval '(unless (require (quote package-lint) nil t) (message "package-lint unavailable; skipping") (kill-emacs 0))' \
+	  --eval '(package-lint-batch-and-exit)' eshell-nix-shell.el
 
 test:
 	$(EMACS) -Q --batch -L . \
-	  -l $(TESTS) -f ert-run-tests-batch-and-exit
+	  -l eshell-nix-shell-tests.el -f ert-run-tests-batch-and-exit
 
 clean:
 	rm -f *.elc
