@@ -3,11 +3,27 @@
 ;; Copyright (C) 2025 Arthur Heymans
 ;;
 ;; Author: Arthur Heymans <arthur@aheymans.xyz>
+;; Assisted-by: OpenAI Codex:gpt-5.6-sol
 ;; Maintainer: Arthur Heymans <arthur@aheymans.xyz>
 ;; Version: 0.1.0
 ;; Package-Requires: ((emacs "30.1"))
 ;; Keywords: processes, unix
 ;; URL: https://github.com/aheymans/eshell-nix-shell
+
+;; This file is not part of GNU Emacs.
+
+;; This program is free software: you can redistribute it and/or modify
+;; it under the terms of the GNU General Public License as published by
+;; the Free Software Foundation, either version 3 of the License, or
+;; (at your option) any later version.
+
+;; This program is distributed in the hope that it will be useful,
+;; but WITHOUT ANY WARRANTY; without even the implied warranty of
+;; MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+;; GNU General Public License for more details.
+
+;; You should have received a copy of the GNU General Public License
+;; along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
 ;;; Commentary:
 
@@ -32,7 +48,7 @@
   :group 'eshell)
 
 (defface eshell-nix-shell-prompt
-  '((t :inherit font-lock-keyword-face :weight bold))
+  '((t :inherit font-lock-keyword-face))
   "Face used for the Nix shell prompt indicator."
   :group 'eshell-nix-shell)
 
@@ -229,19 +245,32 @@ Malformed entries are retained, and duplicate names use the first record."
     (unwind-protect
         (progn
           (run-hooks 'eshell-nix-shell-before-enter-hook)
-          (with-suppressed-warnings ((lexical process-environment))
-            (setq-local process-environment
-                        (eshell-nix-shell--filter-environment
-                         environment
-                         (eshell-nix-shell--frame-process-environment frame))))
-          (let ((path (eshell-nix-shell--env-value "PATH" process-environment)))
+          (let* ((filtered
+                  (eshell-nix-shell--filter-environment
+                   environment
+                   (eshell-nix-shell--frame-process-environment frame)))
+                 (path (eshell-nix-shell--env-value "PATH" filtered)))
+            (with-suppressed-warnings ((lexical process-environment))
+              (setq-local
+               process-environment
+               (if (file-remote-p default-directory)
+                   ;; Tramp launches its local transport with this variable,
+                   ;; then forwards entries that differ from the top-level
+                   ;; environment.  Keep the local entries first so commands
+                   ;; such as ssh, podman, and kubectl remain launchable.
+                   (append (copy-sequence
+                            (default-toplevel-value 'process-environment))
+                           filtered)
+                 filtered)))
             (eshell-set-path (eshell-nix-shell--path-list path))
-            (with-suppressed-warnings ((lexical exec-path))
-              (setq-local exec-path (eshell-nix-shell--exec-path path))))
+            ;; Tramp uses the local `exec-path' to launch its transport.
+            ;; Remote command lookup uses Eshell's connection-local path.
+            (unless (file-remote-p default-directory)
+              (with-suppressed-warnings ((lexical exec-path))
+                (setq-local exec-path (eshell-nix-shell--exec-path path)))))
           (when eshell-nix-shell-change-directory
-            (unless (and directory (file-directory-p directory)
-                         (not (file-remote-p directory)))
-              (error "Nix shell returned an invalid local directory"))
+            (unless (and directory (file-directory-p directory))
+              (error "Nix shell returned an invalid directory"))
             (setq default-directory (file-name-as-directory directory)))
           (push frame eshell-nix-shell--environment-stack)
           (run-hooks 'eshell-nix-shell-after-enter-hook
@@ -270,16 +299,21 @@ Malformed entries are retained, and duplicate names use the first record."
   (eshell-nix-shell-pop))
 
 (defun eshell-nix-shell--make-capture ()
-  "Create private environment and directory capture files."
-  (let ((env (make-temp-file "eshell-nix-shell-env-")) cwd)
+  "Create private environment and directory capture files.
+On a remote Eshell, create the files on the same host as the shell."
+  (let ((remote-prefix (file-remote-p default-directory))
+        (env (make-nearby-temp-file "eshell-nix-shell-env-"))
+        cwd)
     (unwind-protect
         (progn
-          (setq cwd (make-temp-file "eshell-nix-shell-cwd-"))
+          (setq cwd (make-nearby-temp-file "eshell-nix-shell-cwd-"))
           (set-file-modes env #o600)
           (set-file-modes cwd #o600)
           (push env eshell-nix-shell--capture-files)
           (push cwd eshell-nix-shell--capture-files)
-          (prog1 (list :environment-file env :directory-file cwd)
+          (prog1 (list :environment-file env
+                       :directory-file cwd
+                       :remote-prefix remote-prefix)
             (setq env nil cwd nil)))
       (when env (ignore-errors (delete-file env)))
       (when cwd (ignore-errors (delete-file cwd))))))
@@ -287,8 +321,10 @@ Malformed entries are retained, and duplicate names use the first record."
 (defun eshell-nix-shell--payload (capture)
   "Return the Bash capture payload for CAPTURE."
   (format "{ for n in $(compgen -e); do printf \"%%s=%%s\\0\" \"$n\" \"${!n}\"; done; } > %s\nprintf \"%%s\\0\" \"$PWD\" > %s"
-          (shell-quote-argument (plist-get capture :environment-file))
-          (shell-quote-argument (plist-get capture :directory-file))))
+          (shell-quote-argument
+           (file-local-name (plist-get capture :environment-file)))
+          (shell-quote-argument
+           (file-local-name (plist-get capture :directory-file)))))
 
 (defun eshell-nix-shell--cleanup-capture (capture)
   "Delete all files belonging to CAPTURE and forget their names."
@@ -339,10 +375,14 @@ Malformed entries are retained, and duplicate names use the first record."
   (let* ((environment (eshell-nix-shell--parse-environment
                        (plist-get capture :environment-file)))
          (directories (eshell-nix-shell--parse-nul-file
-                       (plist-get capture :directory-file))))
+                       (plist-get capture :directory-file)))
+         (directory (car directories))
+         (remote-prefix (plist-get capture :remote-prefix)))
     (unless (= (length directories) 1)
       (error "Invalid Nix shell directory capture"))
-    (eshell-nix-shell--apply environment (car directories)
+    (when remote-prefix
+      (setq directory (concat remote-prefix directory)))
+    (eshell-nix-shell--apply environment directory
                              (plist-get capture :arguments))))
 
 (defun eshell-nix-shell--kill-hook (process status)
@@ -412,8 +452,6 @@ PROCESS may instead be a command string on synchronous platforms."
 
 (defun eshell-nix-shell--activate (&rest arguments)
   "Start an activation using ARGUMENTS as a deferrable Lisp command."
-  (when (file-remote-p default-directory)
-    (user-error "Nix shell activation is not supported in remote directories"))
   (when eshell-nix-shell--pending-capture
     (user-error "A Nix shell activation is already in progress"))
   (when-let ((context (eshell-nix-shell--unsupported-context-p)))

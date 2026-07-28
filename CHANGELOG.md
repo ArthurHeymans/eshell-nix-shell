@@ -18,7 +18,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - End-of-file (`C-d`) deactivation matching `exit` at an empty Eshell prompt.
 - Starship-style prompt integration that preserves existing custom prompts.
 - A `package-lint` development target and expanded pass-through, output,
-  discovery, `--pure`, and `shellHook` tests.
+  discovery, `--pure`, `shellHook`, and opt-in TRAMP integration tests.
+- TRAMP activation with host-local private captures, remote command lookup, and
+  remote directory restoration.
 
 ### Fixed
 

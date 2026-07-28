@@ -10,11 +10,13 @@
       pkgsFor = system: import nixpkgs { inherit system; };
       emacsFor = pkgs:
         (pkgs.emacsPackagesFor pkgs.emacs).emacsWithPackages
-          (epkgs: [ epkgs.package-lint ]);
+          (epkgs: [ epkgs.flycheck epkgs.flycheck-package epkgs.package-lint ]);
     in {
       devShells = forAllSystems (system:
         let pkgs = pkgsFor system; emacs = emacsFor pkgs; in {
-          default = pkgs.mkShell { packages = [ emacs pkgs.nix pkgs.gnumake ]; };
+          default = pkgs.mkShell {
+            packages = [ emacs pkgs.bashInteractive pkgs.nix pkgs.gnumake ];
+          };
         });
 
       checks = forAllSystems (system:
@@ -22,7 +24,7 @@
           test = pkgs.stdenvNoCC.mkDerivation {
             name = "eshell-nix-shell-test";
             src = self;
-            nativeBuildInputs = [ emacs pkgs.gnumake pkgs.nix ];
+            nativeBuildInputs = [ emacs pkgs.bashInteractive pkgs.gnumake ];
             buildPhase = "make all";
             installPhase = "touch $out";
           };
@@ -34,7 +36,8 @@
           emacs = emacsFor pkgs;
           test = pkgs.writeShellApplication {
             name = "eshell-nix-shell-test";
-            runtimeInputs = [ emacs pkgs.gnumake pkgs.nix ];
+            runtimeInputs =
+              [ emacs pkgs.bashInteractive pkgs.gnumake pkgs.nix ];
             text = ''
               work=$(mktemp -d)
               trap 'rm -rf "$work"' EXIT

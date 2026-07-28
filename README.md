@@ -41,10 +41,12 @@ or buries Eshell. `nix-shell-exit` is the explicit equivalent. Unlike vanilla
 Eshell `exit`, an `exit` that pops an environment continues the rest of a
 compound form.
 
-Activation is deliberately rejected in pipelines, background jobs, subcommands,
-and remote Eshell buffers. Explicit command and informational invocations such
-as `--run`, `--command`, `--help`, and `--version` pass through to the external
-program. Use `*nix-shell` or `/:nix-shell` to force external execution.
+Activation is deliberately rejected in pipelines, background jobs, and
+subcommands. Remote Eshell buffers are supported through TRAMP: `nix-shell`,
+the capture files, imported `PATH`, and optional directory changes all remain on
+the remote host. Explicit command and informational invocations such as `--run`,
+`--command`, `--help`, and `--version` pass through to the external program. Use
+`*nix-shell` or `/:nix-shell` to force external execution.
 `eshell-nix-shell-executable` selects the executable that is launched, but the
 intercepted Eshell command name intentionally remains the unqualified
 `nix-shell`.
@@ -88,9 +90,10 @@ finishing in the same buffer. This is a documented compatibility limitation.
 
 ## Reliability and security
 
-Captures use private mode-0600 temporary files and are removed after success,
-failure, cancellation, or buffer destruction. Destroying a buffer first stops
-its pending activation process, preventing it from recreating capture files. Unsafe transient variables are
+Captures use private mode-0600 temporary files on the same host as the Eshell
+buffer and are removed after success, failure, cancellation, or buffer
+destruction. Destroying a buffer first stops its pending activation process,
+preventing it from recreating capture files. Unsafe transient variables are
 filtered, while the parent Eshell's `TERM` and `INSIDE_EMACS` are preserved.
 Imported variables influence subprocesses launched from the buffer, so activate
 only environments you trust.
@@ -107,6 +110,12 @@ make clean && make all
 
 The `package-lint` step runs when that package is installed and otherwise skips
 cleanly; the Nix flake check provides the reproducible full lint environment.
+The TRAMP integration test is opt-in because it needs a prepared remote host
+with the test fixture's `nix-shell` and `ens-new-command` executables:
+
+```sh
+ENS_TRAMP_DIRECTORY=/ssh:host:/tmp/ make test-tramp
+```
 
 ## Related approaches
 

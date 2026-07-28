@@ -1,5 +1,5 @@
 EMACS ?= emacs
-.PHONY: all compile checkdoc package-lint test clean
+.PHONY: all compile checkdoc package-lint test test-tramp clean
 
 all: compile checkdoc package-lint test
 
@@ -20,6 +20,13 @@ package-lint:
 test:
 	$(EMACS) -Q --batch -L . \
 	  -l eshell-nix-shell-tests.el -f ert-run-tests-batch-and-exit
+
+test-tramp:
+	test -n "$(ENS_TRAMP_DIRECTORY)" || \
+	  { echo "Set ENS_TRAMP_DIRECTORY to a writable Tramp directory" >&2; exit 2; }
+	$(EMACS) -Q --batch -L . \
+	  -l eshell-nix-shell-tests.el \
+	  --eval '(ert-run-tests-batch-and-exit "^eshell-nix-shell-tramp-integration$$")'
 
 clean:
 	rm -f *.elc

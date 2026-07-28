@@ -1,8 +1,24 @@
 ;;; eshell-nix-shell-tests.el --- Tests for eshell-nix-shell  -*- lexical-binding: t; -*-
 
-;; Copyright (C) 2025 Arthur
-;; Author: Arthur
+;; Copyright (C) 2025 Arthur Heymans
+;; Author: Arthur Heymans <arthur@aheymans.xyz>
+;; Assisted-by: OpenAI Codex:gpt-5.6-sol
 ;; Package-Requires: ((emacs "30.1"))
+
+;; This file is not part of GNU Emacs.
+
+;; This program is free software: you can redistribute it and/or modify
+;; it under the terms of the GNU General Public License as published by
+;; the Free Software Foundation, either version 3 of the License, or
+;; (at your option) any later version.
+
+;; This program is distributed in the hope that it will be useful,
+;; but WITHOUT ANY WARRANTY; without even the implied warranty of
+;; MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+;; GNU General Public License for more details.
+
+;; You should have received a copy of the GNU General Public License
+;; along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
 ;;; Commentary:
 
@@ -45,7 +61,8 @@
 
 (defun eshell-nix-shell-tests--wait ()
   "Wait for the current Eshell's foreground process to finish."
-  (let ((deadline (+ (float-time) 10)))
+  (let ((deadline (+ (float-time)
+                     (if (file-remote-p default-directory) 30 10))))
     (while (and (or (eshell-interactive-process-p)
                     (seq-some #'eshell-process-active-p eshell-process-list)
                     eshell-nix-shell--pending-capture)
@@ -204,14 +221,63 @@
     (should-not (eshell-nix-shell--activation-p args))))
 
 (ert-deftest eshell-nix-shell-payload-quotes-files ()
-  "Generated payload quotes paths and consists of Bash builtins."
-  (let* ((capture '(:environment-file "/tmp/a b'c"
-                    :directory-file "/tmp/d e"))
+  "Generated payload quotes local path names and uses Bash builtins."
+  (let* ((capture '(:environment-file "/ssh:host:/tmp/a b'c"
+                    :directory-file "/ssh:host:/tmp/d e"))
          (payload (eshell-nix-shell--payload capture)))
-    (should (string-match-p (regexp-quote (shell-quote-argument "/tmp/a b'c")) payload))
-    (should (string-match-p (regexp-quote (shell-quote-argument "/tmp/d e")) payload))
+    (should (string-match-p
+             (regexp-quote (shell-quote-argument "/tmp/a b'c")) payload))
+    (should (string-match-p
+             (regexp-quote (shell-quote-argument "/tmp/d e")) payload))
+    (should-not (string-match-p "/ssh:host:" payload))
     (should (string-match-p "compgen -e" payload))
     (should-not (string-match-p "env -0" payload))))
+
+(ert-deftest eshell-nix-shell-import-restores-remote-directory-prefix ()
+  "A remote capture turns the shell's local PWD into a Tramp name."
+  (let ((environment-file
+         (eshell-nix-shell-tests--write-nul '("PATH=/remote/bin")))
+        (directory-file
+         (eshell-nix-shell-tests--write-nul '("/remote/project")))
+        applied)
+    (unwind-protect
+        (cl-letf (((symbol-function 'eshell-nix-shell--apply)
+                   (lambda (environment directory arguments)
+                     (setq applied (list environment directory arguments)))))
+          (eshell-nix-shell--import-capture
+           (list :environment-file environment-file
+                 :directory-file directory-file
+                 :remote-prefix "/ssh:host:"
+                 :arguments '("shell.nix")))
+          (should (equal applied
+                         '(("PATH=/remote/bin")
+                           "/ssh:host:/remote/project"
+                           ("shell.nix")))))
+      (delete-file environment-file)
+      (delete-file directory-file))))
+
+(ert-deftest eshell-nix-shell-apply-allows-valid-remote-directory ()
+  "Opt-in directory changes retain a valid Tramp directory."
+  (eshell-nix-shell-tests--with-eshell
+    (let* ((eshell-nix-shell-change-directory t)
+           (remote "/ssh:host:/remote/project/")
+           (default-directory "/ssh:host:/remote/start/")
+           (original-exec-path exec-path))
+      (cl-letf (((symbol-function 'file-directory-p)
+                 (lambda (directory) (equal directory remote)))
+                ((symbol-function 'eshell-get-path)
+                 (lambda (&optional _literal) '("/remote/old")))
+                ((symbol-function 'eshell-set-path) #'ignore))
+        (eshell-nix-shell--apply '("PATH=/remote/bin") remote nil))
+      (should (equal default-directory remote))
+      (should (equal exec-path original-exec-path))
+      (should-not (local-variable-p 'exec-path))
+      (should (equal (getenv "PATH")
+                     (getenv-internal
+                      "PATH" (default-toplevel-value
+                              'process-environment))))
+      (should (member "PATH=/remote/bin" process-environment))
+      (eshell-nix-shell-pop))))
 
 (ert-deftest eshell-nix-shell-default-prompt-omits-package-option ()
   "The default package prompt emphasizes package names, not `-p'."
@@ -250,7 +316,9 @@
   "Run BODY in Eshell with a fake `nix-shell' and introduced command."
   (declare (indent 0) (debug t))
   `(ert-with-temp-directory root
-     (let* ((bindir (expand-file-name "bin" root))
+     (let* ((bash (or (executable-find "bash")
+                      (error "Bash is required for integration tests")))
+            (bindir (expand-file-name "bin" root))
             (shell (expand-file-name "nix-shell" root))
             (tool (expand-file-name "ens-new-command" bindir)))
        (make-directory bindir)
@@ -258,7 +326,7 @@
          (insert "#!/bin/sh\nprintf 'introduced:%s\\n' \"$FAKE_LAYER\"\n"))
        (set-file-modes tool #o700)
        (with-temp-file shell
-         (insert "#!/bin/bash\n"
+         (insert (format "#!%s\n" bash)
                  "payload=; layer=default; fail=\n"
                  "while (($#)); do\n"
                  " case $1 in\n"
@@ -273,7 +341,8 @@
                  "[[ $fail ]] && { echo fake-failure >&2; exit 9; }\n"
                  "export FAKE_LAYER=$layer\n"
                  "export PATH=$FAKE_TOOL_DIR:$PATH\n"
-                 "[[ $payload ]] && /bin/bash -c \"$payload\"\n"))
+                 (format "[[ $payload ]] && %s -c \"$payload\"\n"
+                         (shell-quote-argument bash))))
        (set-file-modes shell #o700)
        (eshell-nix-shell-tests--with-eshell
          (setq-local process-environment
@@ -624,6 +693,35 @@
                                    (shell-quote-argument expression)))))
               (should (string-match-p "hook-failed" output)))
             (should (equal process-environment before))
+            (should-not eshell-nix-shell--environment-stack)))))))
+
+(ert-deftest eshell-nix-shell-tramp-integration ()
+  "Activation and command lookup work in a configured remote fixture."
+  (let ((remote-directory (getenv "ENS_TRAMP_DIRECTORY")))
+    (skip-unless remote-directory)
+    (let ((default-directory
+           (file-name-as-directory remote-directory)))
+      (skip-unless (file-directory-p default-directory))
+      (eshell-nix-shell-tests--with-eshell
+        (let ((original (symbol-function 'eshell-nix-shell--make-capture))
+              capture-files)
+          (cl-letf (((symbol-function 'eshell-nix-shell--make-capture)
+                     (lambda ()
+                       (let ((capture (funcall original)))
+                         (setq capture-files
+                               (list (plist-get capture :environment-file)
+                                     (plist-get capture :directory-file)))
+                         capture))))
+            (eshell-nix-shell-mode 1)
+            (eshell-nix-shell-tests--command
+             "nix-shell --argstr layer tramp")
+            (should (equal (getenv "FAKE_LAYER") "tramp"))
+            (should (seq-every-p #'file-remote-p capture-files))
+            (should-not (seq-some #'file-exists-p capture-files))
+            (should (string-match-p
+                     "introduced:tramp"
+                     (eshell-nix-shell-tests--command "ens-new-command")))
+            (eshell-nix-shell-pop)
             (should-not eshell-nix-shell--environment-stack)))))))
 
 (provide 'eshell-nix-shell-tests)
