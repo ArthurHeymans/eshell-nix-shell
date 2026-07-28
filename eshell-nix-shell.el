@@ -31,6 +31,11 @@
   "Activate Nix shell environments in Eshell."
   :group 'eshell)
 
+(defface eshell-nix-shell-prompt
+  '((t :inherit font-lock-keyword-face :weight bold))
+  "Face used for the Nix shell prompt indicator."
+  :group 'eshell-nix-shell)
+
 (defcustom eshell-nix-shell-executable "nix-shell"
   "Executable used to create Nix shell environments.
 This may be an absolute path.  Command interception intentionally remains
@@ -67,6 +72,13 @@ The parent values of `INSIDE_EMACS' and `TERM' are always preserved too."
 It receives the activation arguments and returns a string."
   :type 'function)
 
+(defcustom eshell-nix-shell-integrate-prompt t
+  "Whether the mode should prepend its segment to the existing prompt.
+The existing `eshell-prompt-function' remains responsible for the main prompt;
+the Nix indicator is added on a separate line and disappears at stack depth
+zero."
+  :type 'boolean)
+
 (defcustom eshell-nix-shell-keep-capture-files-on-error nil
   "Whether failed activation captures should be retained for debugging.
 The private environment and directory files remain mode 0600 and their paths
@@ -100,6 +112,9 @@ are reported in Eshell.  Successful captures are always deleted."
 (defvar-local eshell-nix-shell--pending-capture nil)
 (defvar-local eshell-nix-shell--pending-process nil)
 (defvar-local eshell-nix-shell--capture-files nil)
+(defvar-local eshell-nix-shell--saved-prompt-function nil)
+(defvar-local eshell-nix-shell--prompt-function-was-local-p nil)
+(defvar-local eshell-nix-shell--prompt-installed-p nil)
 
 (defun eshell-nix-shell--debug (format-string &rest arguments)
   "Record FORMAT-STRING with ARGUMENTS when debugging is enabled."
@@ -450,20 +465,21 @@ PROCESS may instead be a command string on synchronous platforms."
 
 (defun eshell-nix-shell--default-prompt-format (arguments)
   "Format a default prompt label from activation ARGUMENTS."
-  (if arguments
-      (let* ((package-tail
-              (cdr (cl-member-if (lambda (argument)
-                                (member argument '("-p" "--packages")))
-                              arguments)))
-             (packages
-              (and package-tail
-                   (seq-take-while
-                    (lambda (argument)
-                      (not (string-prefix-p "-" argument)))
-                    package-tail))))
-        (format "[nix-shell: %s]"
-                (string-join (or packages arguments) " ")))
-    "[nix-shell]"))
+  (let* ((package-tail
+          (cdr (cl-member-if (lambda (argument)
+                               (member argument '("-p" "--packages")))
+                             arguments)))
+         (packages
+          (and package-tail
+               (seq-take-while
+                (lambda (argument)
+                  (not (string-prefix-p "-" argument)))
+                package-tail)))
+         (label (if arguments
+                    (format "❄ nix-shell  %s"
+                            (string-join (or packages arguments) " "))
+                  "❄ nix-shell")))
+    (propertize label 'face 'eshell-nix-shell-prompt)))
 
 ;;;###autoload
 (defun eshell-nix-shell-prompt-segment ()
@@ -473,6 +489,43 @@ Return the empty string when no environment is active."
       (funcall eshell-nix-shell-prompt-format-function
                (eshell-nix-shell--frame-activation-arguments frame))
     ""))
+
+(defun eshell-nix-shell--prompt-function ()
+  "Return the existing Eshell prompt with a Nix shell indicator prepended."
+  (let ((prompt (funcall eshell-nix-shell--saved-prompt-function))
+        (segment (eshell-nix-shell-prompt-segment)))
+    (if (string-empty-p segment)
+        prompt
+      (if (string-prefix-p "\n" prompt)
+          (concat "\n" segment "\n" (substring prompt 1))
+        (concat segment "\n" prompt)))))
+
+(defun eshell-nix-shell--install-prompt ()
+  "Install buffer-local prompt integration when requested."
+  (with-suppressed-warnings ((free-vars eshell-prompt-function)
+                             (lexical eshell-prompt-function))
+    (when (and eshell-nix-shell-integrate-prompt
+               (not eshell-nix-shell--prompt-installed-p))
+      (setq eshell-nix-shell--saved-prompt-function eshell-prompt-function
+            eshell-nix-shell--prompt-function-was-local-p
+            (local-variable-p 'eshell-prompt-function)
+            eshell-nix-shell--prompt-installed-p t)
+      (setq-local eshell-prompt-function
+                  #'eshell-nix-shell--prompt-function))))
+
+(defun eshell-nix-shell--remove-prompt ()
+  "Remove prompt integration and restore the previous prompt function."
+  (with-suppressed-warnings ((free-vars eshell-prompt-function)
+                             (lexical eshell-prompt-function))
+    (when eshell-nix-shell--prompt-installed-p
+      (when (eq eshell-prompt-function #'eshell-nix-shell--prompt-function)
+        (if eshell-nix-shell--prompt-function-was-local-p
+            (setq-local eshell-prompt-function
+                        eshell-nix-shell--saved-prompt-function)
+          (kill-local-variable 'eshell-prompt-function)))
+      (setq eshell-nix-shell--saved-prompt-function nil
+            eshell-nix-shell--prompt-function-was-local-p nil
+            eshell-nix-shell--prompt-installed-p nil))))
 
 (defun eshell-nix-shell--exit-advice (original &rest arguments)
   "Call ORIGINAL with ARGUMENTS, or pop the active environment."
@@ -534,6 +587,7 @@ behavior."
                    #'eshell-nix-shell--command-handler t)
       (remove-hook 'eshell-kill-hook #'eshell-nix-shell--kill-hook t)
       (remove-hook 'kill-buffer-hook #'eshell-nix-shell--cleanup-all t)
+      (eshell-nix-shell--remove-prompt)
       (eshell-nix-shell--cleanup-all))
     (when (and first-error (not force))
       (signal (car first-error) (cdr first-error)))))
@@ -552,7 +606,8 @@ order.  It refuses to disable while activation is in progress."
         (add-hook 'eshell-named-command-hook
                   #'eshell-nix-shell--command-handler nil t)
         (add-hook 'eshell-kill-hook #'eshell-nix-shell--kill-hook -90 t)
-        (add-hook 'kill-buffer-hook #'eshell-nix-shell--cleanup-all nil t))
+        (add-hook 'kill-buffer-hook #'eshell-nix-shell--cleanup-all nil t)
+        (eshell-nix-shell--install-prompt))
     (eshell-nix-shell--disable)))
 
 (defconst eshell-nix-shell--completion-options

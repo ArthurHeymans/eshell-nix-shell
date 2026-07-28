@@ -26,9 +26,11 @@ Eshell buffers:
 
 ```text
 ~ $ nix-shell -p hello jq
-[nix-shell: hello jq] ~ $ hello
+❄ nix-shell  hello jq
+~ $ hello
 Hello, world!
-[nix-shell: hello jq] ~ $ exit
+❄ nix-shell  hello jq
+~ $ exit
 ~ $
 ```
 
@@ -49,10 +51,12 @@ intercepted Eshell command name intentionally remains the unqualified
 
 ## Prompt customization
 
-The mode does not replace your prompt. Include
-`(eshell-nix-shell-prompt-segment)` in a custom `eshell-prompt-function` if you
-want an environment label. Customize
-`eshell-nix-shell-prompt-format-function` to change its format.
+By default the mode prepends a Starship-style Nix indicator on its own line
+while preserving the existing `eshell-prompt-function`. Set
+`eshell-nix-shell-integrate-prompt` to nil to disable automatic integration.
+Custom prompts can instead call `(eshell-nix-shell-prompt-segment)` directly.
+Customize `eshell-nix-shell-prompt-format-function` or the
+`eshell-nix-shell-prompt` face to change its appearance.
 
 By default a `shellHook` directory change is not applied. Set
 `eshell-nix-shell-change-directory` non-nil to opt in. Customize

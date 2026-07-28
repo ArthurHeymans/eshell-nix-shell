@@ -16,6 +16,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Eshell-visible failure diagnostics, optional debug logging, and opt-in
   retention of failed capture files.
 - End-of-file (`C-d`) deactivation matching `exit` at an empty Eshell prompt.
+- Starship-style prompt integration that preserves existing custom prompts.
 - A `package-lint` development target and expanded pass-through, output,
   discovery, `--pure`, and `shellHook` tests.
 

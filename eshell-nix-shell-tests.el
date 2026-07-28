@@ -227,9 +227,26 @@
 
 (ert-deftest eshell-nix-shell-default-prompt-omits-package-option ()
   "The default package prompt emphasizes package names, not `-p'."
-  (should (equal (eshell-nix-shell--default-prompt-format
-                  '("-p" "hello" "jq"))
-                 "[nix-shell: hello jq]")))
+  (should (equal (substring-no-properties
+                  (eshell-nix-shell--default-prompt-format
+                   '("-p" "hello" "jq")))
+                 "❄ nix-shell  hello jq")))
+
+(ert-deftest eshell-nix-shell-prompt-wraps-and-restores-custom-prompt ()
+  "Prompt integration preserves and restores an existing custom prompt."
+  (eshell-nix-shell-tests--with-eshell
+    (let ((custom-prompt (lambda () "\nproject λ ")))
+      (setq-local eshell-prompt-function custom-prompt)
+      (eshell-nix-shell-mode 1)
+      (should (eq eshell-prompt-function
+                  #'eshell-nix-shell--prompt-function))
+      (should (equal (eshell-nix-shell--prompt-function) "\nproject λ "))
+      (eshell-nix-shell--apply '("PATH=/one") nil '("-p" "hello"))
+      (should (equal (substring-no-properties
+                      (eshell-nix-shell--prompt-function))
+                     "\n❄ nix-shell  hello\nproject λ "))
+      (eshell-nix-shell-mode -1)
+      (should (eq eshell-prompt-function custom-prompt)))))
 
 (defmacro eshell-nix-shell-tests--with-fake (&rest body)
   "Run BODY in Eshell with a fake `nix-shell' and introduced command."
