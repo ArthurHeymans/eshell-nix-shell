@@ -21,6 +21,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   discovery, `--pure`, `shellHook`, and opt-in TRAMP integration tests.
 - TRAMP activation with host-local private captures, remote command lookup, and
   remote directory restoration.
+- Documentation of the `buildFHSEnv` mount-namespace limitation and its
+  workarounds.
 
 ### Fixed
 

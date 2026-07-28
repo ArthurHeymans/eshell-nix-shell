@@ -4,6 +4,8 @@
 > variables only. Bash functions, arrays, aliases, traps, shell options, and
 > non-exported variables cannot be represented in Eshell. In particular,
 > commands such as `buildPhase` do **not** exist in an activated Eshell.
+> Mount-namespace environments such as `buildFHSEnv` are also out of reach; see
+> [Mount-namespace environments](#mount-namespace-environments-buildfhsenv).
 
 `eshell-nix-shell` activates legacy `nix-shell` environments directly in the
 current Eshell buffer. It captures the environment after Nix setup and the
@@ -50,6 +52,38 @@ the remote host. Explicit command and informational invocations such as `--run`,
 `eshell-nix-shell-executable` selects the executable that is launched, but the
 intercepted Eshell command name intentionally remains the unqualified
 `nix-shell`.
+
+## Mount-namespace environments (`buildFHSEnv`)
+
+Environments built with `pkgs.buildFHSEnv` (and similar `bubblewrap`-based
+wrappers) cannot be activated in Eshell. This is a structural limit, not a
+missing feature.
+
+Such a shell exposes its tools at FHS paths like `/usr/bin` and `/lib` that
+exist **only inside a private mount namespace**, entered by running the
+generated wrapper (for example `coreboot-env`). An environment is a set of
+variables; a namespace is a property of a process. Variables cannot carry a
+namespace across the `nix-shell` process boundary into Emacs, so neither this
+package nor any other environment-importing tool can reproduce it.
+
+Concretely, a `shell.nix` whose `shellHook` ends in `exec some-fhs-env` yields
+an Eshell that is missing the expected tools. The capture runs through
+`nix-shell --run`, so a hook that skips the `exec` when non-interactive is
+bypassed entirely and only the outer `mkShell` environment is imported. Even if
+the capture ran inside the wrapper, the imported `PATH` would name directories
+that do not exist outside it.
+
+Workarounds, in rough order of cleanliness:
+
+- Expose the tools in the outer `mkShell` as well as in the FHS environment,
+  sharing one package list between `targetPkgs` and `nativeBuildInputs`. Eshell
+  then has real tools on `PATH`, and builds that genuinely need FHS paths still
+  run through `fhs-env -c 'make -j4'`.
+- Start Emacs itself inside the FHS environment (for example as a daemon), so
+  Eshell and every subprocess inherit the namespace.
+- Skip activation and define an Eshell alias or function that routes each
+  command through `nix-shell --run "fhs-env -c ..."`. Nothing lands on `PATH`,
+  and every call pays `nix-shell` startup.
 
 ## Prompt customization
 
