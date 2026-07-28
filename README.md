@@ -1,5 +1,9 @@
 # eshell-nix-shell
 
+<p align="center">
+  <img src="assets/eshell-nix-shell.jpg" alt="Eshell and Nix logo" width="400">
+</p>
+
 Activate legacy `nix-shell` environments directly in the current Eshell buffer,
 without keeping a nested Bash process.
 
