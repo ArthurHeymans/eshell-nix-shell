@@ -159,6 +159,20 @@
        (lambda (&rest _) (setq original-called t)))
       (should original-called))))
 
+(ert-deftest eshell-nix-shell-ctrl-d-key-pops-at-empty-prompt ()
+  "The minor-mode keymap handles `C-d' before custom Eshell bindings."
+  (eshell-nix-shell-tests--with-eshell
+    (setq-local process-environment '("PATH=/zero" "L=zero"))
+    (eshell-set-path '("/zero"))
+    (eshell-nix-shell-mode 1)
+    (should (eq (key-binding (kbd "C-d")) #'eshell-nix-shell--ctrl-d))
+    (eshell-nix-shell--apply '("PATH=/one" "L=one") nil '("one"))
+    (goto-char (point-max))
+    (should (= (point) eshell-last-output-end))
+    (eshell-nix-shell--ctrl-d)
+    (should-not eshell-nix-shell--environment-stack)
+    (should (equal (getenv "L") "zero"))))
+
 (ert-deftest eshell-nix-shell-apply-is-atomic ()
   "An error during activation restores state and stack depth."
   (eshell-nix-shell-tests--with-eshell

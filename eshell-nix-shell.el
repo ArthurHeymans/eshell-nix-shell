@@ -492,6 +492,29 @@ end-of-file command and by common Eshell configurations that bind `C-d'."
       (eshell-nix-shell-pop)
     (apply original arguments)))
 
+(defun eshell-nix-shell--ctrl-d ()
+  "Pop an active environment at an empty prompt, otherwise handle `C-d'.
+The fallback command is resolved with this minor mode temporarily disabled, so
+user configurations such as Doom Eshell retain their normal delete-or-exit
+behavior."
+  (interactive)
+  (if (and eshell-nix-shell--environment-stack
+           (eobp)
+           (= (point) eshell-last-output-end)
+           (not (eshell-head-process)))
+      (eshell-nix-shell-pop)
+    (let* ((eshell-nix-shell-mode nil)
+           (fallback (key-binding (kbd "C-d"))))
+      (unless (commandp fallback)
+        (user-error "No underlying Eshell C-d command"))
+      (call-interactively fallback))))
+
+(defvar eshell-nix-shell-mode-map
+  (let ((map (make-sparse-keymap)))
+    (define-key map (kbd "C-d") #'eshell-nix-shell--ctrl-d)
+    map)
+  "Keymap for `eshell-nix-shell-mode'.")
+
 (defun eshell-nix-shell--disable (&optional force)
   "Remove local integration and restore frames; FORCE cancels activation."
   (when (and eshell-nix-shell--pending-capture (not force))
