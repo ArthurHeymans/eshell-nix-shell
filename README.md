@@ -106,8 +106,11 @@ configured executable.
 
 ## TRAMP
 
-Remote Eshell buffers are supported. The `nix-shell` process, capture files,
-imported paths, and optional directory changes remain on the remote host.
+Remote Eshell buffers are supported for TRAMP methods that implement remote
+process execution, such as SSH-based methods and containers. The `nix-shell`
+process, capture files, imported paths, and optional directory changes remain
+on the remote host. File-only methods such as GVFS, archive, rclone, and
+sudoedit do not provide remote process execution and cannot activate a shell.
 
 ## FHS and mount-namespace environments
 

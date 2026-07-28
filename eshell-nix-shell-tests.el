@@ -275,6 +275,10 @@
                 ((symbol-function 'eshell-set-path) #'ignore))
         (eshell-nix-shell--apply '("PATH=/remote/bin") remote nil))
       (should (equal default-directory remote))
+      (should eshell-nix-shell--remote-path-active-p)
+      (should (equal eshell-nix-shell--remote-path '("/remote/bin")))
+      (should (equal eshell-nix-shell--remote-environment
+                     '("PATH=/remote/bin")))
       (should (equal exec-path original-exec-path))
       (should-not (local-variable-p 'exec-path))
       (should (equal (getenv "PATH")
@@ -282,7 +286,49 @@
                       "PATH" (default-toplevel-value
                               'process-environment))))
       (should (member "PATH=/remote/bin" process-environment))
-      (eshell-nix-shell-pop))))
+      (eshell-nix-shell-pop)
+      (should-not eshell-nix-shell--remote-path-active-p)
+      (should-not eshell-nix-shell--remote-environment))))
+
+(ert-deftest eshell-nix-shell-tramp-propagates-buffer-local-imports ()
+  "Current Tramp must not classify imported entries as local baseline state."
+  (let ((default-directory "/ssh:host:/tmp/")
+        (eshell-nix-shell--remote-environment '("ENS_IMPORTED=value")))
+    (should-not
+     (eshell-nix-shell--tramp-local-environment-variable-advice
+      (lambda (_argument) t) "ENS_IMPORTED=value"))
+    (should
+     (eshell-nix-shell--tramp-local-environment-variable-advice
+      (lambda (_argument) t) "LOCAL_ONLY=value"))))
+
+(ert-deftest eshell-nix-shell-remote-variable-prefers-imported-value ()
+  "Eshell expansion sees an imported value even when a local value exists."
+  (let ((default-directory "/ssh:host:/tmp/")
+        (process-environment '("ENS_COLLISION=local" "ENS_COLLISION=remote"))
+        (eshell-variable-aliases-list nil)
+        (eshell-nix-shell--remote-environment '("ENS_COLLISION=remote")))
+    (should (equal (eshell-get-variable "ENS_COLLISION") "remote"))))
+
+(ert-deftest eshell-nix-shell-remote-path-is-buffer-local ()
+  "Managed PATH values do not leak between Eshell buffers on one connection."
+  (let ((first (generate-new-buffer " *ens-remote-first*"))
+        (second (generate-new-buffer " *ens-remote-second*")))
+    (unwind-protect
+        (progn
+          (with-current-buffer first
+            (setq default-directory "/ssh:host:/tmp/"
+                  eshell-nix-shell--remote-path-active-p t
+                  eshell-nix-shell--remote-path '("/nix/first"))
+            (should (equal (eshell-get-path t) '("/nix/first"))))
+          (with-current-buffer second
+            (setq default-directory "/ssh:host:/tmp/"
+                  eshell-nix-shell--remote-path-active-p t
+                  eshell-nix-shell--remote-path '("/nix/second"))
+            (should (equal (eshell-get-path t) '("/nix/second"))))
+          (with-current-buffer first
+            (should (equal (eshell-get-path t) '("/nix/first")))))
+      (kill-buffer first)
+      (kill-buffer second))))
 
 (ert-deftest eshell-nix-shell-default-prompt-omits-package-option ()
   "The default package prompt emphasizes package names, not `-p'."

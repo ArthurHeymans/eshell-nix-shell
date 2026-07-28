@@ -39,6 +39,7 @@
 (require 'esh-mode)
 (require 'esh-proc)
 (require 'esh-util)
+(require 'esh-var)
 (require 'pcomplete)
 (require 'seq)
 (require 'subr-x)
@@ -123,13 +124,16 @@ are reported in Eshell.  Successful captures are always deleted."
 (cl-defstruct (eshell-nix-shell--frame
                (:constructor eshell-nix-shell--make-frame))
   name process-environment path exec-path exec-path-local-p default-directory
-  activation-arguments metadata)
+  remote-environment remote-path-active-p activation-arguments metadata)
 
 (defvar-local eshell-nix-shell--environment-stack nil)
 (defvar-local eshell-nix-shell--pending-capture nil)
 (defvar-local eshell-nix-shell--pending-process nil)
 (defvar-local eshell-nix-shell--capture-files nil)
 (defvar-local eshell-nix-shell--saved-prompt-function nil)
+(defvar-local eshell-nix-shell--remote-environment nil)
+(defvar-local eshell-nix-shell--remote-path nil)
+(defvar-local eshell-nix-shell--remote-path-active-p nil)
 (defvar-local eshell-nix-shell--prompt-function-was-local-p nil)
 (defvar-local eshell-nix-shell--prompt-installed-p nil)
 
@@ -157,13 +161,81 @@ are reported in Eshell.  Successful captures are always deleted."
         (when (and (stringp entry) (string-prefix-p prefix entry))
           (throw 'value (substring entry (length prefix))))))))
 
+(defun eshell-nix-shell--env-entry (name environment)
+  "Return NAME's entry in ENVIRONMENT, including an unset marker."
+  (let ((prefix (concat name "=")))
+    (seq-find (lambda (entry)
+                (and (stringp entry)
+                     (or (string= entry name)
+                         (string-prefix-p prefix entry))))
+              environment)))
+
+(defun eshell-nix-shell--get-path-advice (original &optional literal-p)
+  "Use the buffer's managed remote path, or call ORIGINAL.
+When LITERAL-P is non-nil, do not add the remote file-name prefix."
+  (if (and eshell-nix-shell--remote-path-active-p
+           (file-remote-p default-directory))
+      (let ((path (copy-sequence eshell-nix-shell--remote-path)))
+        (if literal-p
+            path
+          (let ((remote (file-remote-p default-directory)))
+            (mapcar (lambda (directory) (concat remote directory)) path))))
+    (funcall original literal-p)))
+
+(defun eshell-nix-shell--set-path-advice (original path)
+  "Set the managed per-buffer remote PATH, or call ORIGINAL with PATH."
+  (if (and eshell-nix-shell--remote-path-active-p
+           (file-remote-p default-directory))
+      (setq eshell-nix-shell--remote-path
+            (if (listp path)
+                (copy-sequence path)
+              (eshell-nix-shell--path-list path)))
+    (funcall original path)))
+
+(defun eshell-nix-shell--get-variable-advice
+    (original name &optional indices quoted)
+  "Read imported remote NAME before calling ORIGINAL.
+INDICES and QUOTED have the meaning used by `eshell-get-variable'."
+  (let ((entry (and (stringp name)
+                    (file-remote-p default-directory)
+                    (not (assoc name eshell-variable-aliases-list))
+                    (eshell-nix-shell--env-entry
+                     name eshell-nix-shell--remote-environment))))
+    (if entry
+        (eshell-apply-indices
+         (and (string-search "=" entry)
+              (substring entry (1+ (string-search "=" entry))))
+         indices quoted)
+      (funcall original name indices quoted))))
+
+(defun eshell-nix-shell--tramp-local-environment-variable-advice
+    (original argument)
+  "Keep imported remote ARGUMENT eligible for propagation by Tramp.
+Call ORIGINAL for variables not managed by the active Nix environment."
+  (if (and (file-remote-p default-directory)
+           (member argument eshell-nix-shell--remote-environment))
+      nil
+    (funcall original argument)))
+
 (defun eshell-nix-shell--restore-frame (frame)
   "Restore all buffer state saved in FRAME."
   (with-suppressed-warnings ((lexical process-environment))
     (setq-local process-environment
                 (copy-sequence
                  (eshell-nix-shell--frame-process-environment frame))))
-  (eshell-set-path (copy-sequence (eshell-nix-shell--frame-path frame)))
+  (setq eshell-nix-shell--remote-environment
+        (copy-sequence
+         (eshell-nix-shell--frame-remote-environment frame)))
+  (if (eshell-nix-shell--frame-remote-path-active-p frame)
+      (setq eshell-nix-shell--remote-path
+            (copy-sequence (eshell-nix-shell--frame-path frame))
+            eshell-nix-shell--remote-path-active-p t)
+    (setq eshell-nix-shell--remote-path nil
+          eshell-nix-shell--remote-path-active-p nil)
+    (unless (file-remote-p
+             (eshell-nix-shell--frame-default-directory frame))
+      (eshell-set-path
+       (copy-sequence (eshell-nix-shell--frame-path frame)))))
   (if (eshell-nix-shell--frame-exec-path-local-p frame)
       (with-suppressed-warnings ((lexical exec-path))
         (setq-local exec-path
@@ -181,6 +253,8 @@ are reported in Eshell.  Successful captures are always deleted."
    :exec-path (copy-sequence exec-path)
    :exec-path-local-p (local-variable-p 'exec-path)
    :default-directory default-directory
+   :remote-environment (copy-sequence eshell-nix-shell--remote-environment)
+   :remote-path-active-p eshell-nix-shell--remote-path-active-p
    :activation-arguments (copy-sequence arguments)))
 
 (defun eshell-nix-shell--path-list (path)
@@ -262,10 +336,20 @@ Malformed entries are retained, and duplicate names use the first record."
                             (default-toplevel-value 'process-environment))
                            filtered)
                  filtered)))
-            (eshell-set-path (eshell-nix-shell--path-list path))
-            ;; Tramp uses the local `exec-path' to launch its transport.
-            ;; Remote command lookup uses Eshell's connection-local path.
-            (unless (file-remote-p default-directory)
+            (if (file-remote-p default-directory)
+                (setq eshell-nix-shell--remote-environment
+                      (seq-remove
+                       (lambda (entry)
+                         (member (substring entry 0 (string-search "=" entry))
+                                 '("TERM" "INSIDE_EMACS")))
+                       filtered)
+                      eshell-nix-shell--remote-path
+                      (eshell-nix-shell--path-list path)
+                      eshell-nix-shell--remote-path-active-p t)
+              (setq eshell-nix-shell--remote-environment nil
+                    eshell-nix-shell--remote-path nil
+                    eshell-nix-shell--remote-path-active-p nil)
+              (eshell-set-path (eshell-nix-shell--path-list path))
               (with-suppressed-warnings ((lexical exec-path))
                 (setq-local exec-path (eshell-nix-shell--exec-path path)))))
           (when eshell-nix-shell-change-directory
@@ -670,6 +754,14 @@ Package-name completion is an intentionally reserved extension point."
                                                    (string-suffix-p ".nix" file)))))))))
 
 (advice-add 'eshell/exit :around #'eshell-nix-shell--exit-advice)
+(advice-add 'eshell-get-path :around #'eshell-nix-shell--get-path-advice)
+(advice-add 'eshell-set-path :around #'eshell-nix-shell--set-path-advice)
+(advice-add 'eshell-get-variable :around
+            #'eshell-nix-shell--get-variable-advice)
+
+(autoload 'tramp-local-environment-variable-p "tramp")
+(advice-add 'tramp-local-environment-variable-p :around
+            #'eshell-nix-shell--tramp-local-environment-variable-advice)
 
 (defun eshell-nix-shell-unload-function ()
   "Restore managed Eshell buffers and remove global integration."
@@ -681,6 +773,14 @@ Package-name completion is an intentionally reserved extension point."
         (setq eshell-nix-shell-mode nil)
         (eshell-nix-shell--disable t))))
   (advice-remove 'eshell/exit #'eshell-nix-shell--exit-advice)
+  (advice-remove 'eshell-get-path #'eshell-nix-shell--get-path-advice)
+  (advice-remove 'eshell-set-path #'eshell-nix-shell--set-path-advice)
+  (advice-remove 'eshell-get-variable
+                 #'eshell-nix-shell--get-variable-advice)
+  (when (fboundp 'tramp-local-environment-variable-p)
+    (advice-remove
+     'tramp-local-environment-variable-p
+     #'eshell-nix-shell--tramp-local-environment-variable-advice))
   nil)
 
 (provide 'eshell-nix-shell)
