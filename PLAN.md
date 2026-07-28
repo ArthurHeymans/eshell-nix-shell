@@ -27,6 +27,10 @@ Bash session, or modifications to Emacs itself.
 - Support interactive activation through legacy `nix-shell`.
 - Support arbitrary `nix-shell` arguments, including `-p`/`--packages`, files,
   attributes, `--pure`, and `--keep`.
+- Support bare `nix-shell` with no arguments, which activates the environment
+  described by `shell.nix` or `default.nix` in the current directory, and
+  `nix-shell FILE.nix`. These are the most common real-world invocations and
+  must be classified as activation, not rejected as degenerate.
 - Capture the environment after Nix setup and `shellHook` execution.
 - Apply the captured environment atomically to the current Eshell buffer.
 - Maintain a buffer-local stack so environments can be nested and restored.
@@ -129,7 +133,24 @@ message rather than produce ambiguous state:
 ```eshell
 nix-shell -p hello | cat
 nix-shell -p hello &
+{ nix-shell -p hello }
 ```
+
+Subcommands must be rejected as well as pipelines and background jobs. Eshell
+rebinds exactly the state an activation mutates when entering a subcommand:
+
+```elisp
+;; esh-var.el, `eshell-subcommand-bindings'
+(process-environment (eshell-copy-environment))
+(eshell-path-env-list eshell-path-env-list)
+```
+
+so an activation inside `{ ... }` or `$( ... )` would appear to succeed and
+then be silently discarded.
+
+Detect the three contexts with `eshell-in-pipeline-p`, `eshell-current-subjob-p`
+(bound by `eshell-do-subjob`), and `eshell-in-subcommand-p`. All three are
+internal Eshell variables; record that dependency in the compatibility notes.
 
 Explicit `--run` and `--command` invocations remain valid in those contexts
 because they pass through normally.
@@ -170,6 +191,28 @@ to enable with:
 ```elisp
 (add-hook 'eshell-mode-hook #'eshell-nix-shell-mode)
 ```
+
+Prefer intercepting commands through the buffer-local `eshell-named-command-hook`
+rather than defining a global `eshell/nix-shell` function. Eshell itself uses
+that hook for `eshell-explicit-command` and `eshell-quoted-file-command`. The
+advantages are decisive:
+
+- The interception is genuinely buffer-local, so disabling the mode really does
+  remove the behavior. A global `eshell/nix-shell` would apply in every Eshell
+  buffer regardless of the mode.
+- Returning nil falls through to the normal external command path, making
+  pass-through the default rather than something the package must reimplement.
+- The same hook scales to `nix develop`/`nix shell`, where defining `eshell/nix`
+  would mean intercepting every `nix` subcommand, including `nix build`.
+
+When using the hook, attach an `eshell-which-function` property to the handler
+so `which nix-shell` keeps reporting something meaningful.
+
+If a Lisp command function is used instead, do not name the package file
+`esh-*.el` or `em-*.el`: `eshell-find-alias-function` treats such files as Eshell
+modules and gates the command on module activation. `eshell-nix-shell.el` is
+safe, and an `eshell/nix-shell` defined there takes precedence over the external
+binary unconditionally.
 
 Optionally provide a globalized mode for convenience, but keep the buffer-local
 mode as the fundamental implementation.
@@ -223,10 +266,18 @@ Conceptually:
 
 ```sh
 nix-shell ARGS --run '
-  env -0 > "$PRIVATE_ENV_FILE"
-  printf "%s\0" "$PWD" > "$PRIVATE_CWD_FILE"
+  { for n in $(compgen -e); do printf "%s=%s\0" "$n" "${!n}"; done; } > PRIVATE_ENV_FILE
+  printf "%s\0" "$PWD" > PRIVATE_CWD_FILE
 '
 ```
+
+Use the bash builtin `compgen -e` (list exported variable names) plus `printf`
+rather than `env -0`. The `--run` payload always executes under bash, so this
+depends on no external binary and therefore cannot break under `--pure` if
+coreutils is absent from the resulting `PATH`. A local 500-iteration benchmark
+measured approximately 1.31 ms per builtin capture versus 2.56 ms for `env -0`.
+The builtin implementation is therefore the final choice on both portability
+and measured performance grounds.
 
 Implementation requirements:
 
@@ -244,37 +295,72 @@ Implementation requirements:
 - Delete all temporary artifacts in success, failure, cancellation, and buffer
   destruction paths.
 
-Investigate whether passing paths through inherited environment variables is
-safer than interpolating them into the `--run` payload. Prefer the approach with
-the smallest quoting and injection surface.
+Interpolate the capture paths into the payload with `shell-quote-argument`
+rather than passing them through inherited environment variables. Inherited
+variables do not survive `--pure`, which strips the environment, so that route
+would require appending `--keep` arguments for the private variables, i.e. more
+package-generated arguments and a `--pure`-conditional code path. The paths come
+from `make-temp-file` and are package-generated, so quoting them is the smaller
+surface.
 
 ### 4.5 Eshell asynchronous integration
 
 Use Eshell's existing process lifecycle rather than starting an unrelated
 process that Eshell cannot sequence.
 
-Expected mechanism:
+Mechanism:
 
-1. `eshell/nix-shell` recognizes activation versus pass-through.
-2. For activation, it invokes the real executable through Eshell's external
-   command machinery.
-3. `eshell-exec-hook` attaches capture metadata to the resulting process.
-4. The external process is returned to Eshell, causing normal evaluator
-   deferral.
+1. The command handler recognizes activation versus pass-through.
+2. Both paths invoke the real executable through `eshell-external-command`.
+3. For activation, attach the capture metadata directly to the returned process
+   object with `process-put` before handing it back. No `eshell-exec-hook` is
+   needed: Emacs is single-threaded, so the sentinel cannot run before the
+   handler returns. This also avoids a global hook that fires for every Eshell
+   buffer, and avoids `eshell-exec-hook`'s argument asymmetry (it receives a
+   command *string*, not a process, on synchronous-process platforms).
+4. Hand the process to Eshell by throwing it, not by returning it:
+
+   ```elisp
+   (throw 'eshell-external (eshell-external-command command args))
+   ```
+
+   This is required. `eshell-lisp-command` always returns nil and *prints* the
+   value of the called function, so a returned process would be displayed as
+   `#<process nix-shell>` and never deferred. The `eshell-external` catch inside
+   `eshell-lisp-command` is the supported escape, and is what `eshell/cat` and
+   `eshell/du` use. Only a value reaching `(eshell-deferrable OBJECT)` as a
+   process triggers deferral.
+
+   Note that `eshell-external-command` may return `t` rather than a process on
+   platforms without `make-process`. Handle both.
 5. A buffer-local `eshell-kill-hook` callback runs when the process and its I/O
-   are complete.
+   are complete. Eshell's own `eshell-resume-command` is installed on the same
+   hook buffer-locally at initialization, so ordering is a hook-depth question,
+   not an open risk. Install with an explicit negative depth:
+
+   ```elisp
+   (add-hook 'eshell-kill-hook #'eshell-nix-shell--kill-hook -90 t)
+   ```
+
+   Relying on "added later, therefore prepended" would work only by accident.
 6. On successful exit, the callback validates and imports the snapshot before
    Eshell resumes the remainder of the command form.
 7. On failure, it preserves the old state and reports a useful diagnostic.
 
-Confirm hook ordering against `eshell-resume-command`. The import callback must
-run before command evaluation resumes. Avoid replacing Eshell's sentinel.
-Chaining or replacing process sentinels is more fragile and should only be used
-if the public hooks cannot provide the required ordering.
+Properties of the hook that the implementation must respect:
 
-Support synchronous-process platforms where practical. If that cannot be done
-without substantial complexity, document the platform limitation and fail
-clearly.
+- It runs inside `eshell-sentinel`'s `finish-io`, only for the primary handle,
+  and only after the process handles have been closed. That is exactly the
+  desired ordering; no sentinel replacement is required.
+- It fires for every process in the buffer, including background jobs, so the
+  callback must gate on its own `process-get` marker.
+- Cancellation is signalled by the *status string* matching
+  `eshell-reset-signals`, not by the exit code. Refuse to import on a signal
+  status even if a complete snapshot exists on disk.
+- On synchronous-process platforms the hook is called as
+  `(COMMAND-STRING EXIT-NUMBER)` instead of `(PROCESS STATUS-STRING)`. Either
+  handle that shape explicitly or detect the platform and fail clearly; do not
+  leave it as "where practical".
 
 ### 4.6 Applying an environment atomically
 
@@ -289,9 +375,27 @@ must act as one logical transaction:
 5. Update `default-directory` if a valid captured directory is available.
 6. Push the frame only after the new state has been installed successfully.
 7. Run `eshell-nix-shell-environment-change-hook`.
-8. Refresh the prompt.
+
+Do not refresh the prompt from the import callback. At that point the command
+form has not resumed; `eshell-resume-command` will finish the form and Eshell
+emits the prompt afterwards. Forcing a refresh risks a duplicate or misplaced
+prompt and can break `nix-shell -p hello; hello`.
 
 If any step fails, roll back every modified value and leave the stack unchanged.
+
+Concrete state-handling notes:
+
+- `process-environment` is already buffer-local in Eshell (set by the variable
+  module at initialization), so installation is a `setq-local` of a fresh list.
+  Never mutate shared list structure.
+- Eshell's path is connection-local, not merely buffer-local: `eshell-set-path`
+  assigns `eshell-path-env-list` inside
+  `with-connection-local-application-variables`. Save with `(eshell-get-path t)`
+  and restore with `eshell-set-path`. Use the literal form, so the remote prefix
+  and the MS-Windows `"."` element that `eshell-get-path` adds when LITERAL-P is
+  nil are not baked into the saved frame.
+- Apply the variable filter (see `eshell-nix-shell-excluded-variables`) before
+  installing, not after.
 
 Treat these details carefully:
 
@@ -325,7 +429,11 @@ Requirements:
 - Make advice inert outside enabled Eshell buffers.
 - Remove advice on package unload.
 - Ensure `exit` used in a larger Eshell command form produces sensible status
-  and continuation behavior.
+  and continuation behavior. Vanilla `eshell/exit` is a single
+  `(throw 'eshell-terminal t)`, caught outside the command form, so today
+  `exit; echo done` never reaches `echo`. A popping `exit` must instead keep
+  evaluating the rest of the form. This is a deliberate divergence and must be
+  documented, not discovered.
 - Provide `eshell/nix-shell-exit` independently of the advice.
 - Test repeated activation/deactivation and final Eshell exit.
 
@@ -373,9 +481,24 @@ Keep customization small and stable. Candidate options:
 eshell-nix-shell-executable
 eshell-nix-shell-use-exit-advice
 eshell-nix-shell-change-directory
+eshell-nix-shell-excluded-variables
 eshell-nix-shell-prompt-format-function
 eshell-nix-shell-keep-capture-files-on-error
 ```
+
+`eshell-nix-shell-excluded-variables` is not optional polish. A verbatim import
+drags in `PS1`, `PWD`, `OLDPWD`, `SHLVL`, `_`, `IN_NIX_SHELL`, `NIX_BUILD_TOP`,
+`NIX_BUILD_CORES`, and `TMPDIR`/`TMP`/`TEMP`/`TEMPDIR`. The temporary-directory
+variables are the dangerous ones: they can point at a directory that disappears
+when the capture process exits, and they would then persist in a long-lived
+Emacs buffer's `process-environment`. Ship a sane default denylist.
+
+`eshell-nix-shell-change-directory` should default to nil: a `shellHook` that
+`cd`s the user's Eshell buffer is surprising, and section 4.6 already treats the
+captured directory as optional.
+
+Preserve the parent Eshell's `INSIDE_EMACS` and `TERM` rather than importing
+Nix's values, which describe the capture bash rather than the Eshell buffer.
 
 Candidate hooks:
 
@@ -395,6 +518,19 @@ there is a demonstrated extension use case.
 Implement a small parser that distinguishes activation from pass-through
 without attempting to fully parse every Nix option.
 
+Activate when:
+
+- there are no arguments at all (Nix discovers `shell.nix`, then `default.nix`,
+  relative to `default-directory`);
+- arguments select an environment (`-p`, a `.nix` file, `-A`, `-E`, ...) and
+  none of the pass-through options below appear.
+
+A scan for pass-through options must skip option *values*, or invocations like
+`nix-shell -p x --argstr msg --run` and `-I --run` will be misclassified. This
+requires a minimal arity table for the options that consume arguments, at least:
+`--arg` (2), `--argstr` (2), `--option` (2), `-I`, `-A`/`--attr`, `-E`/`--expr`,
+`--keep`, `--max-jobs`/`-j`, `--cores`.
+
 Pass through when arguments include at least:
 
 - `--run`
@@ -413,6 +549,11 @@ Avoid changing the meaning of explicitly qualified executable paths such as:
 ```
 
 Only the unqualified `nix-shell` command should receive package behavior.
+
+Users can force the external binary with Eshell's existing escapes:
+`*nix-shell` (`eshell-explicit-command-char`, which bypasses Lisp functions and
+aliases) or `/:nix-shell` (which additionally bypasses file name handlers).
+Both are long-standing; no new syntax is required.
 
 ## 6. Reliability and security
 
@@ -470,7 +611,9 @@ Test pure helpers without invoking Nix:
 
 ### Eshell integration tests
 
-Use helpers from Emacs's Eshell test suite where practical. Cover:
+Reuse `test/lisp/eshell/eshell-tests-helpers.el` from the Emacs tree; it provides
+the buffer setup and command-matching helpers this package needs and is the
+difference between a day and a week of scaffolding. Cover:
 
 - successful activation updates `$PATH`;
 - an executable introduced by the environment is found by Eshell;
@@ -483,7 +626,10 @@ Use helpers from Emacs's Eshell test suite where practical. Cover:
 - stdout and stderr remain visible;
 - capture files are removed;
 - disabling the mode removes behavior;
-- independent Eshell buffers do not share environments.
+- independent Eshell buffers do not share environments;
+- `*nix-shell` and `/:nix-shell` pass through to the external binary;
+- activation inside `{ ... }`, a pipeline, or a background job is rejected;
+- bare `nix-shell` and `nix-shell FILE.nix` are classified as activation.
 
 ### Nix-backed tests
 
@@ -496,28 +642,37 @@ nixpkgs packages. Test:
 - multiline environment values;
 - `shellHook` output does not corrupt capture;
 - `shellHook` directory changes;
-- `--pure` behavior;
+- `--pure` behavior, including that the capture payload still works when
+  coreutils is absent from the resulting `PATH`;
+- a local `shell.nix` activated by bare `nix-shell`;
 - nonzero `shellHook`/activation failure.
 
 Avoid network access in the default test suite.
 
 ### Compatibility matrix
 
+Set the floor at **Emacs 30.1**. The asynchronous command lifecycle this design
+depends on (`eshell-foreground-command`, `eshell-add-command`,
+`eshell-resume-command` on `eshell-kill-hook`) was restructured in 30.1, and
+`eshell-get-path`/`eshell-set-path` replaced the older `eshell-path-env` string
+in 29.1. Supporting 29 would mean maintaining a second, materially different
+resumption path for little benefit.
+
 Initially test against:
 
-- the oldest supported Emacs release;
+- Emacs 30.1;
 - current stable Emacs;
 - Emacs master where CI makes that practical;
 - representative Nix 2.x releases;
 - GNU/Linux and macOS.
 
-Determine the oldest Emacs version from the APIs actually used rather than
-choosing an arbitrary compatibility claim.
-
 ## 8. Documentation
 
 README sections:
 
+0. Fidelity limits up front: exported scalars are imported; bash functions,
+   arrays, and aliases are not, so build phases such as `buildPhase` do not
+   exist in the activated Eshell.
 1. Motivation and the child-shell problem.
 2. Installation from source/package archive.
 3. Minimal configuration.
@@ -558,10 +713,12 @@ without invoking Nix.
 ### Phase 2: asynchronous capture process
 
 - Generate secure capture files and payload.
-- Launch through Eshell's external process machinery.
-- Attach process metadata through `eshell-exec-hook`.
-- Import through `eshell-kill-hook` before evaluator resumption.
-- Implement cleanup and cancellation.
+- Launch through `eshell-external-command` and hand the process to Eshell with
+  `(throw 'eshell-external ...)`.
+- Attach process metadata with `process-put` on the returned process.
+- Import through a depth-ordered buffer-local `eshell-kill-hook` callback,
+  before evaluator resumption.
+- Implement cleanup and cancellation, including signal-status detection.
 
 Exit criterion: a fake environment-producing executable activates correctly,
 and sequencing tests pass.
@@ -569,8 +726,11 @@ and sequencing tests pass.
 ### Phase 3: `nix-shell` command
 
 - Implement activation/pass-through classification.
-- Add `eshell/nix-shell` and `eshell/nix-shell-exit`.
-- Handle failures and unsupported pipeline/background contexts.
+- Register the `nix-shell` handler on the buffer-local
+  `eshell-named-command-hook`, with an `eshell-which-function` property; add
+  `eshell/nix-shell-exit`.
+- Handle bare `nix-shell`, `nix-shell FILE.nix`, and the option arity table.
+- Handle failures and unsupported pipeline/background/subcommand contexts.
 - Add Nix-backed tests.
 
 Exit criterion: `nix-shell -p hello; hello` works in Eshell and `exit` restores
@@ -587,10 +747,39 @@ Exit criterion: package is comfortable for daily interactive use.
 
 ### Phase 5: modern Nix commands
 
-- Add adapters for `nix develop` and `nix shell`.
-- Reuse the same environment stack and process lifecycle.
-- Investigate `nix print-dev-env --json` as an optimization while preserving
-  shellHook-compatible semantics.
+- Add adapters for `nix develop` and `nix shell`, reusing the same environment
+  stack and process lifecycle.
+- Intercept through `eshell-named-command-hook`, dispatching on the first
+  subcommand. Do not define `eshell/nix`: that would place every `nix`
+  subcommand, including `nix build` and `nix flake update`, behind this package.
+- Capture with `nix develop ARGS -c bash -c PAYLOAD`, which is structurally
+  identical to `nix-shell --run` and captures post-`shellHook` state.
+- The `nix develop` pass-through set is different: `-c`/`--command`,
+  `--profile`, and the phase options `--build --check --configure --install
+  --unpack --phase`.
+- `nix develop` requires the `nix-command` and `flakes` experimental features.
+  Detect their absence and fail with a comprehensible message instead of
+  surfacing a raw Nix error.
+- Treat installables (`.#default`, `nixpkgs#hello`, `-f shell.nix`) as opaque
+  strings: record them for the prompt label, never parse them.
+- Whether `shellHook` runs under `-c` is inconsistently reported in the wild.
+  Do not reason about it; add a Nix-backed test with a devshell whose
+  `shellHook` exports a variable, asserted visible in Eshell after activation.
+- `nix print-dev-env --json` remains an optimization only. It *describes* the
+  environment rather than entering it: `shellHook` is emitted as a variable the
+  consumer is expected to evaluate itself (this is what direnv's `use flake`
+  does). Adopting it naively would silently change semantics for every devshell
+  relying on `shellHook`.
+- `nix shell` is the easy third case: no `shellHook`, same `-c bash -c PAYLOAD`
+  capture. Do it last, as a check that the adapter interface is not overfit to
+  `nix-shell`.
+- Document the fidelity limit prominently here. `nix print-dev-env --json` shows
+  what a devshell really contains: `bashFunctions` (`buildPhase`, `genericBuild`,
+  `runHook`, ...) and array-typed variables (`postUnpackHooks`, ...). Only
+  exported scalars are imported, so `nix develop` followed by `buildPhase` -- a
+  completely normal workflow -- fails in Eshell with "command not found". Nobody
+  notices this with `nix-shell -p`; with `nix develop`, and with `nix-shell` on a
+  real derivation, it is the headline limitation.
 
 Exit criterion: modern and legacy Nix environment commands share consistent
 Eshell behavior.
@@ -626,28 +815,42 @@ The release is ready when all of the following hold:
 - Unit and integration tests pass without network access.
 - Limitations around Bash-only state are explicitly documented.
 
-## 11. Open questions to resolve during implementation
+## 11. Open questions
 
-1. Does `eshell-kill-hook` ordering remain stable across supported Emacs
-   versions, or is a command replacement form more robust?
-2. Should a `shellHook` directory change affect the entered Eshell directory by
-   default, or should that be opt-in?
-3. What is the best behavior when disabling the mode with active frames?
-4. How should `exit` behave inside compound commands such as `exit; echo done`?
-5. Which Eshell syntax reliably forces the external `nix-shell` across all
-   supported Emacs versions?
-6. Can synchronous-process platforms be supported without duplicating process
-   lifecycle logic?
-7. Should imported variables such as `INSIDE_EMACS` be preserved from the
-   parent Eshell, accepted from Nix verbatim, or regenerated by Eshell's normal
-   variable-alias machinery?
-8. Should the first release expose a generic adapter API, or wait until the Nix
+### Resolved during review
+
+1. **`eshell-kill-hook` ordering.** Stable and controllable.
+   `eshell-resume-command` is itself a buffer-local member of that hook, so an
+   explicit negative depth is sufficient. No command replacement form needed.
+2. **`shellHook` directory changes.** Opt-in; `eshell-nix-shell-change-directory`
+   defaults to nil.
+3. **Disabling the mode with active frames.** Pop all frames unconditionally;
+   signal an error if a foreground activation is in flight. No confirmation
+   prompt, since minor modes are frequently disabled from Lisp.
+4. **`exit` in compound commands.** A popping `exit` must continue evaluating
+   the rest of the form, unlike vanilla `eshell/exit`. Documented divergence.
+5. **Forcing the external binary.** `*nix-shell` or `/:nix-shell`; both already
+   exist in Eshell.
+6. **`INSIDE_EMACS` and friends.** Preserve the parent Eshell's values; Nix's
+   describe the capture bash, not the buffer.
+7. **Capture helper portability.** Use the bash builtins `compgen -e` and
+   `printf`; no external binary and no helper script required.
+8. **Payload paths through inherited environment variables.** Rejected:
+    inherited variables do not survive `--pure` without extra `--keep`
+    arguments. Interpolate `make-temp-file` paths with `shell-quote-argument`.
+9. **Synchronous-process platforms.** Supported through a buffer-local pending
+   capture because no process object is available to mark. This is weaker than
+   the normal per-process property: an unrelated process finishing in the same
+   buffer while activation is pending could trigger the import. Record this as
+   a compatibility limitation rather than duplicate Eshell lifecycle logic.
+
+### Still open
+
+1. Should the first release expose a generic adapter API, or wait until the Nix
    implementation demonstrates the correct abstraction?
-9. Is `env -0` available in every realistic Nix shell, or should the package
-   provide a small helper executable/script with a stronger portability
-   guarantee?
-10. Can activation payload paths be passed solely through inherited environment
-    variables to eliminate generated shell interpolation?
+2. Should re-activation detect an edited `shell.nix`, or is exit-and-reenter
+    the documented answer? (Leaning: documented answer; live tracking is what
+    `direnv`/`envrc` exist for.)
 
 ## 12. Initial implementation recommendation
 
