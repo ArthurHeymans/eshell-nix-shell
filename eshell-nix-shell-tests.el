@@ -292,6 +292,62 @@ advised functions without an enabled mode must claim it themselves."
                   ("--help") ("-h") ("--version")))
     (should-not (eshell-nix-shell--activation-p args))))
 
+(ert-deftest eshell-nix-shell-modern-command-classification ()
+  "Modern shell commands activate while explicit commands pass through."
+  (dolist (case '(("shell" nil) ("shell" ("nixpkgs#hello"))
+                  ("develop" nil) ("develop" (".#backend"))
+                  ("develop" ("--option" "name" "--command"))
+                  ("shell" ("--set-env-var" "FOO" "--command"
+                            "nixpkgs#hello"))
+                  ("shell" ("-k" "--help" "nixpkgs#hello"))
+                  ("develop" ("--arg-from-file" "source" "--build" "."))
+                  ("develop" ("--override-flake" "original" "--phase"
+                              "."))
+                  ("develop" ("-s" "PHASE" "--build" "."))))
+    (should (eshell-nix-shell--modern-activation-p (car case) (cadr case))))
+  (should (equal (eshell-nix-shell--modern-invocation
+                  '("--offline" "develop" "."))
+                 '("develop" "--offline" ".")))
+  (should (equal (eshell-nix-shell--modern-invocation
+                  '("--extra-experimental-features" "nix-command flakes"
+                    "shell" "nixpkgs#hello"))
+                 '("shell" "--extra-experimental-features"
+                   "nix-command flakes" "nixpkgs#hello")))
+  (should-not (eshell-nix-shell--modern-invocation
+               '("--offline" "build" ".")))
+  (dolist (case '(("build" nil) ("shell" ("--help"))
+                  ("shell" ("nixpkgs#hello" "-c" "hello"))
+                  ("develop" ("--command" "make"))
+                  ("develop" ("--build"))
+                  ("develop" ("--phase" "configurePhase"))))
+    (should-not
+     (eshell-nix-shell--modern-activation-p (car case) (cadr case)))))
+
+(ert-deftest eshell-nix-shell-modern-capture-resolves-bash-before-activation ()
+  "Modern capture uses a resolved Bash path immune to PATH replacement."
+  (let (launched eshell-nix-shell--pending-capture
+        eshell-nix-shell--pending-process)
+    (cl-letf (((symbol-function 'eshell-nix-shell--check-context) #'ignore)
+              ((symbol-function 'eshell-nix-shell--external-file-name)
+               (lambda (command)
+                 (should (equal command "bash"))
+                 "/nix/store/test-bash/bin/bash"))
+              ((symbol-function 'eshell-nix-shell--make-capture)
+               (lambda () (list :arguments nil)))
+              ((symbol-function 'eshell-nix-shell--payload)
+               (lambda (_capture) "capture"))
+              ((symbol-function 'eshell-external-command)
+               (lambda (executable arguments)
+                 (setq launched (cons executable arguments))
+                 'started)))
+      (should (eq (eshell-nix-shell--activate
+                   "shell" "nixpkgs#hello" "--ignore-env")
+                  'started))
+      (should (equal launched
+                     '("nix" "shell" "nixpkgs#hello" "--ignore-env"
+                       "--command" "/nix/store/test-bash/bin/bash"
+                       "-c" "capture"))))))
+
 (ert-deftest eshell-nix-shell-payload-quotes-files ()
   "Generated payload quotes local path names and uses Bash builtins."
   (let* ((capture '(:environment-file "/ssh:host:/tmp/a b'c"
@@ -423,6 +479,13 @@ advised functions without an enabled mode must claim it themselves."
                      (concat "/usr/bin/nix-shell"
                              " (activation managed by eshell-nix-shell-mode)")))
       (should-not (eshell-nix-shell--which "nix-build")))
+    (let ((eshell-nix-executable "nix"))
+      (cl-letf (((symbol-function 'eshell-nix-shell--external-file-name)
+                 (lambda (_command) "/usr/bin/nix")))
+        (should (equal (eshell-nix-shell--which "nix")
+                       (concat "/usr/bin/nix"
+                               " (activation managed by "
+                               "eshell-nix-shell-mode)")))))
     ;; An unresolvable command still describes the configured name.
     (cl-letf (((symbol-function 'eshell-nix-shell--external-file-name)
                (lambda (_command) nil)))
@@ -452,6 +515,16 @@ advised functions without an enabled mode must claim it themselves."
                    '("-p" "hello" "jq")))
                  "❄ nix-shell  hello jq")))
 
+(ert-deftest eshell-nix-shell-default-prompt-describes-modern-command ()
+  "The default prompt distinguishes modern shell and develop activations."
+  (should (equal (substring-no-properties
+                  (eshell-nix-shell--default-prompt-format
+                   '("shell" "nixpkgs#hello")))
+                 "❄ nix shell  nixpkgs#hello"))
+  (should (equal (substring-no-properties
+                  (eshell-nix-shell--default-prompt-format '("develop")))
+                 "❄ nix develop")))
+
 (ert-deftest eshell-nix-shell-prompt-wraps-and-restores-custom-prompt ()
   "Prompt integration preserves and restores an existing custom prompt."
   (eshell-nix-shell-tests--with-eshell
@@ -479,13 +552,14 @@ advised functions without an enabled mode must claim it themselves."
     (should-not eshell-prompt-function)))
 
 (defmacro eshell-nix-shell-tests--with-fake (&rest body)
-  "Run BODY in Eshell with a fake `nix-shell' and introduced command."
+  "Run BODY in Eshell with fake Nix commands and an introduced command."
   (declare (indent 0) (debug t))
   `(ert-with-temp-directory root
      (let* ((bash (or (executable-find "bash")
                       (error "Bash is required for integration tests")))
             (bindir (expand-file-name "bin" root))
             (shell (expand-file-name "nix-shell" root))
+            (nix (expand-file-name "nix" root))
             (tool (expand-file-name "ens-new-command" bindir)))
        (make-directory bindir)
        (with-temp-file tool
@@ -510,6 +584,23 @@ advised functions without an enabled mode must claim it themselves."
                  (format "[[ $payload ]] && %s -c \"$payload\"\n"
                          (shell-quote-argument bash))))
        (set-file-modes shell #o700)
+       (with-temp-file nix
+         (insert (format "#!%s\n" bash)
+                 "kind=$1; shift; layer=$kind; fail=; command=()\n"
+                 "while (($#)); do\n"
+                 " case $1 in\n"
+                 "  --command|-c) shift; command=(\"$@\"); break;;\n"
+                 "  --option) [[ $2 == fake-layer ]] && layer=$3; shift 3;;\n"
+                 "  --fail) fail=1; shift;;\n"
+                 "  --help) echo fake-nix-help; exit 0;;\n"
+                 "  *) shift;;\n"
+                 " esac\n"
+                 "done\n"
+                 "[[ $fail ]] && { echo fake-nix-failure >&2; exit 9; }\n"
+                 "export FAKE_LAYER=$layer\n"
+                 "export PATH=$FAKE_TOOL_DIR:$PATH\n"
+                 "((${#command[@]})) && \"${command[@]}\"\n"))
+       (set-file-modes nix #o700)
        (eshell-nix-shell-tests--with-eshell
          (setq-local process-environment
                      (cons (concat "FAKE_TOOL_DIR=" bindir)
@@ -517,7 +608,8 @@ advised functions without an enabled mode must claim it themselves."
                                  process-environment)))
          (eshell-set-path (eshell-nix-shell--path-list (getenv "PATH")))
          (setq-local exec-path (eshell-nix-shell--exec-path (getenv "PATH")))
-         (let ((eshell-nix-shell-executable shell))
+         (let ((eshell-nix-shell-executable shell)
+               (eshell-nix-executable nix))
            (eshell-nix-shell-mode 1)
            ,@body)))))
 
@@ -529,6 +621,35 @@ advised functions without an enabled mode must claim it themselves."
     (should (executable-find "ens-new-command"))
     (should (string-match-p "introduced:one"
                             (eshell-nix-shell-tests--command "ens-new-command")))))
+
+(ert-deftest eshell-nix-shell-integration-modern-shell-and-develop ()
+  "Modern Nix shell commands import environments and nest normally."
+  (eshell-nix-shell-tests--with-fake
+    (eshell-nix-shell-tests--command
+     "nix shell nixpkgs#hello --option fake-layer modern-shell")
+    (should (equal (getenv "FAKE_LAYER") "modern-shell"))
+    (should (string-match-p "introduced:modern-shell"
+                            (eshell-nix-shell-tests--command
+                             "ens-new-command")))
+    (should (equal (substring-no-properties
+                    (eshell-nix-shell-prompt-segment))
+                   (concat "❄ nix shell  nixpkgs#hello --option "
+                           "fake-layer modern-shell")))
+    (eshell-nix-shell-tests--command
+     "nix develop .#default --option fake-layer modern-develop")
+    (should (equal (getenv "FAKE_LAYER") "modern-develop"))
+    (should (= (length eshell-nix-shell--environment-stack) 2))
+    (eshell-nix-shell-pop)
+    (should (equal (getenv "FAKE_LAYER") "modern-shell"))))
+
+(ert-deftest eshell-nix-shell-integration-modern-pass-through ()
+  "Explicit modern Nix commands execute without importing an environment."
+  (eshell-nix-shell-tests--with-fake
+    (should (string-match-p
+             "modern-pass"
+             (eshell-nix-shell-tests--command
+              "nix shell nixpkgs#hello --command printf modern-pass")))
+    (should-not eshell-nix-shell--environment-stack)))
 
 (ert-deftest eshell-nix-shell-integration-preserves-numeric-arguments ()
   "Eshell leaves numeric-looking activation arguments as strings."
@@ -779,6 +900,10 @@ advised functions without an enabled mode must claim it themselves."
       (with-temp-file (expand-file-name "notes.txt" root) (insert "x\n"))
       (setq default-directory (file-name-as-directory root))
       (eshell-nix-shell-mode 1)
+      (should (member "shell"
+                      (eshell-nix-shell-tests--completions "nix sh")))
+      (should (member "develop"
+                      (eshell-nix-shell-tests--completions "nix de")))
       ;; The first argument completes to legacy option names.
       (should (member "--pure"
                       (eshell-nix-shell-tests--completions "nix-shell --pu")))

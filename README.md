@@ -4,8 +4,8 @@
   <img src="assets/eshell-nix-shell.jpg" alt="Eshell and Nix logo" width="400">
 </p>
 
-Activate legacy `nix-shell` environments directly in the current Eshell buffer,
-without keeping a nested Bash process.
+Activate `nix-shell`, `nix shell`, and `nix develop` environments directly in
+the current Eshell buffer, without keeping a nested Bash process.
 
 Requires Emacs 30.1 or newer.
 
@@ -30,7 +30,19 @@ Hello, world!
 ```
 
 The package supports bare `nix-shell`, expression files, packages, attributes,
-`--pure`, and other activation options.
+`--pure`, and other activation options. It also supports modern flake-based
+activations:
+
+```text
+~ $ nix shell nixpkgs#hello nixpkgs#jq
+❄ nix shell  nixpkgs#hello nixpkgs#jq
+~ $ exit
+~ $ nix develop .#backend
+❄ nix develop  .#backend
+```
+
+Modern `nix` subcommands other than `shell` and `develop` continue to execute
+normally.
 
 Environments can be nested. Run `exit`, `nix-shell-exit`, or press `C-d` at an
 empty prompt to restore the previous environment.
@@ -38,10 +50,13 @@ empty prompt to restore the previous environment.
 Explicit command and informational invocations are passed to the external
 program, including:
 
-- `--run` and `--command`
+- `nix-shell --run` and `nix-shell --command`
+- `nix shell --command`/`-c`
+- `nix develop --command`/`-c` and build-phase options such as `--build`
 - `--help` and `--version`
 
-Use `*nix-shell` or `/:nix-shell` to force external execution.
+Use `*nix-shell`, `/:nix-shell`, `*nix`, or `/:nix` to force external
+execution.
 
 Activation is not supported inside pipelines, background jobs, or subcommands.
 
@@ -97,15 +112,16 @@ Directory changes made by `shellHook` are ignored by default. To apply them:
 
 ### Other options
 
-- `eshell-nix-shell-executable` selects the executable to launch.
+- `eshell-nix-shell-executable` selects the legacy executable to launch.
+- `eshell-nix-executable` selects the modern `nix` executable to launch.
 - `eshell-nix-shell-excluded-variables` controls which variables are not
   imported.
 - `eshell-nix-shell-process-kill-timeout` bounds the wait for a cancelled
   activation process that refuses to die, for instance one blocked on an
   unresponsive remote connection.
 
-The intercepted Eshell command remains named `nix-shell`, regardless of the
-configured executable.
+The intercepted Eshell commands remain named `nix-shell` and `nix`, regardless
+of the configured executables.
 
 Loading the library has no effect on its own: the advice this package needs on
 `eshell/exit`, Eshell's path and variable accessors, and TRAMP is installed
@@ -185,7 +201,7 @@ ENS_TRAMP_DIRECTORY=/ssh:host:/tmp/ make test-tramp
 - [`nix-mode`](https://github.com/NixOS/nix-mode) provides Nix editing support.
 - [`envrc`](https://github.com/purcell/envrc) and direnv provide automatic,
   project-oriented environment activation.
-- A terminal `nix-shell` retains complete Bash state, while this package keeps
+- A terminal Nix shell retains complete shell state, while this package keeps
   Eshell and imports only exported scalar variables.
 
 ## License

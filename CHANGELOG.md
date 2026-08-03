@@ -9,7 +9,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
-- Buffer-local `nix-shell` activation with asynchronous Eshell sequencing.
+- Buffer-local `nix-shell`, `nix shell`, and `nix develop` activation with
+  asynchronous Eshell sequencing.
 - Atomic nested environment restoration and `exit` integration.
 - Secure NUL-delimited capture, variable filtering, prompt segment, completion,
   and unit/integration tests.

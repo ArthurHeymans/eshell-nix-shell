@@ -27,9 +27,10 @@
 
 ;;; Commentary:
 
-;; Activate a legacy nix-shell environment in the current Eshell buffer.
-;; Exported scalar variables, but not Bash aliases, functions, or arrays, are
-;; imported.  Add `eshell-nix-shell-mode' to `eshell-mode-hook' to enable it.
+;; Activate `nix-shell', `nix shell', and `nix develop' environments in the
+;; current Eshell buffer.  Exported scalar variables, but not Bash aliases,
+;; functions, or arrays, are imported.  Add `eshell-nix-shell-mode' to
+;; `eshell-mode-hook' to enable it.
 
 ;;; Code:
 
@@ -54,9 +55,15 @@
   :group 'eshell-nix-shell)
 
 (defcustom eshell-nix-shell-executable "nix-shell"
-  "Executable used to create Nix shell environments.
+  "Executable used to create legacy Nix shell environments.
 This may be an absolute path.  Command interception intentionally remains
 attached to the unqualified Eshell command name `nix-shell'."
+  :type 'string)
+
+(defcustom eshell-nix-executable "nix"
+  "Executable used for `nix shell' and `nix develop' environments.
+This may be an absolute path.  Command interception intentionally remains
+attached to the unqualified Eshell command name `nix'."
   :type 'string)
 
 (defcustom eshell-nix-shell-debug nil
@@ -583,26 +590,40 @@ called directly."
   (when-let* ((context (eshell-nix-shell--unsupported-context-p)))
     (user-error "Nix shell activation is not supported in %s" context)))
 
-(defun eshell-nix-shell--activate (&rest arguments)
-  "Start an activation using ARGUMENTS as a deferrable Lisp command."
+(defun eshell-nix-shell--activate (kind &rest arguments)
+  "Start a KIND activation using ARGUMENTS as a deferrable Lisp command."
   (when eshell-nix-shell--pending-capture
     (user-error "A Nix shell activation is already in progress"))
   (eshell-nix-shell--check-context)
-  (dolist (argument arguments)
+  (dolist (argument (cons kind arguments))
     (when (and (stringp argument) (string-search "\0" argument))
       (user-error "Nix shell arguments may not contain NUL bytes")))
-  (let* ((capture (eshell-nix-shell--make-capture))
+  (let* ((legacy-p (string= kind "nix-shell"))
+         (executable (if legacy-p
+                         eshell-nix-shell-executable
+                       eshell-nix-executable))
+         (capture-shell
+          (unless legacy-p
+            (or (eshell-nix-shell--external-file-name "bash")
+                (user-error "Bash is required for Nix environment capture"))))
+         (capture (eshell-nix-shell--make-capture))
          (payload (eshell-nix-shell--payload capture))
-         (args (append arguments (list "--run" payload)))
+         (activation-arguments (if legacy-p
+                                   arguments
+                                 (cons kind arguments)))
+         (args (if legacy-p
+                   (append arguments (list "--run" payload))
+                 (append activation-arguments
+                         (list "--command" capture-shell "-c" payload))))
          result)
-    (setf (plist-get capture :arguments) (copy-sequence arguments))
+    (setf (plist-get capture :arguments)
+          (copy-sequence activation-arguments))
     (setq eshell-nix-shell--pending-capture capture)
     (eshell-nix-shell--debug "Starting activation with %d argument(s)"
                              (length arguments))
     (condition-case error-data
         (progn
-          (setq result (eshell-external-command
-                        eshell-nix-shell-executable args))
+          (setq result (eshell-external-command executable args))
           (when (processp result)
             (process-put result 'eshell-nix-shell--capture capture)
             (setq eshell-nix-shell--pending-process result))
@@ -625,12 +646,80 @@ called directly."
 
 (put 'eshell-nix-shell--activate 'eshell-no-numeric-conversions t)
 
+(defconst eshell-nix-shell--modern-pass-through-options
+  '("--command" "-c" "--help" "-h" "--version")
+  "Modern Nix options that make an invocation non-interactive.")
+
+(defconst eshell-nix-shell--develop-phase-options
+  '("--unpack" "--configure" "--build" "--check" "--install"
+    "--installcheck" "--phase")
+  "`nix develop' options that run a build phase instead of a shell.")
+
+(defconst eshell-nix-shell--modern-option-arities
+  '(("--arg-from-file" . 2) ("--arg-from-stdin" . 1)
+    ("--eval-store" . 1) ("--experimental-features" . 1)
+    ("--extra-experimental-features" . 1) ("--file" . 1) ("-f" . 1)
+    ("--inputs-from" . 1) ("--keep-env-var" . 1) ("-k" . 1)
+    ("--output-lock-file" . 1) ("--override-flake" . 2)
+    ("--override-input" . 2) ("--profile" . 1)
+    ("--redirect" . 2) ("--reference-lock-file" . 1)
+    ("--set-env-var" . 2) ("-s" . 2) ("--store" . 1)
+    ("--unset-env-var" . 1) ("-u" . 1) ("--update-input" . 1))
+  "Number of values consumed by modern Nix options not in the legacy table.")
+
+(defun eshell-nix-shell--modern-invocation (arguments)
+  "Normalize supported modern Nix ARGUMENTS, or return nil.
+Global options preceding the subcommand are moved after it because the
+activation function receives the subcommand separately."
+  (let ((args arguments) prefix)
+    (while (and args (string-prefix-p "-" (car args)))
+      (let* ((option (pop args))
+             (arity (or (cdr (assoc option
+                                    eshell-nix-shell--modern-option-arities))
+                        (cdr (assoc option
+                                    eshell-nix-shell--option-arities))
+                        0)))
+        (push option prefix)
+        (dotimes (_ arity)
+          (when args (push (pop args) prefix)))))
+    (when (member (car args) '("shell" "develop"))
+      (cons (car args) (append (nreverse prefix) (cdr args))))))
+
+(defun eshell-nix-shell--modern-activation-p (kind arguments)
+  "Return non-nil when `nix' KIND with ARGUMENTS should be activated."
+  (when (member kind '("shell" "develop"))
+    (let ((args arguments) (activation t))
+      (while args
+        (let* ((argument (pop args))
+               (arity (or (cdr (assoc argument
+                                      eshell-nix-shell--modern-option-arities))
+                          (cdr (assoc argument
+                                      eshell-nix-shell--option-arities)))))
+          (when (or (member argument
+                            eshell-nix-shell--modern-pass-through-options)
+                    (and (string= kind "develop")
+                         (member argument
+                                 eshell-nix-shell--develop-phase-options)))
+            (setq activation nil args nil))
+          (dotimes (_ (or arity 0)) (when args (pop args)))))
+      activation)))
+
 (defun eshell-nix-shell--command-handler (command arguments)
   "Handle unqualified COMMAND with ARGUMENTS when it is an activation."
-  (when (and (string= command "nix-shell")
-             (eshell-nix-shell--activation-p arguments))
+  (cond
+   ((and (string= command "nix-shell")
+         (eshell-nix-shell--activation-p arguments))
     (eshell-nix-shell--check-context)
-    (eshell-lisp-command #'eshell-nix-shell--activate arguments)))
+    (eshell-lisp-command #'eshell-nix-shell--activate
+                         (cons "nix-shell" arguments)))
+   ((string= command "nix")
+    (when-let* ((invocation (eshell-nix-shell--modern-invocation arguments))
+                (kind (car invocation))
+                (modern-arguments (cdr invocation))
+                ((eshell-nix-shell--modern-activation-p
+                  kind modern-arguments)))
+      (eshell-nix-shell--check-context)
+      (eshell-lisp-command #'eshell-nix-shell--activate invocation)))))
 
 (defun eshell-nix-shell--external-file-name (command)
   "Return the file name Eshell would run for external COMMAND, or nil.
@@ -645,31 +734,39 @@ that do not provide it."
 
 (defun eshell-nix-shell--which (command)
   "Describe interception of COMMAND for Eshell's `which' command."
-  (when (string= command "nix-shell")
-    (let ((external (eshell-nix-shell--external-file-name
-                     eshell-nix-shell-executable)))
+  (when (member command '("nix-shell" "nix"))
+    (let* ((configured (if (string= command "nix-shell")
+                           eshell-nix-shell-executable
+                         eshell-nix-executable))
+           (external (eshell-nix-shell--external-file-name configured)))
       (format "%s (activation managed by eshell-nix-shell-mode)"
-              (or external eshell-nix-shell-executable)))))
+              (or external configured)))))
 
 (put 'eshell-nix-shell--command-handler 'eshell-which-function
      #'eshell-nix-shell--which)
 
 (defun eshell-nix-shell--default-prompt-format (arguments)
   "Format a default prompt label from activation ARGUMENTS."
-  (let* ((package-tail
+  (let* ((modern-kind (and (member (car arguments) '("shell" "develop"))
+                           (car arguments)))
+         (display-arguments (if modern-kind (cdr arguments) arguments))
+         (package-tail
           (cdr (cl-member-if (lambda (argument)
                                (member argument '("-p" "--packages")))
-                             arguments)))
+                             display-arguments)))
          (packages
           (and package-tail
                (seq-take-while
                 (lambda (argument)
                   (not (string-prefix-p "-" argument)))
                 package-tail)))
-         (label (if arguments
-                    (format "❄ nix-shell  %s"
-                            (string-join (or packages arguments) " "))
-                  "❄ nix-shell")))
+         (command-label (if modern-kind
+                            (concat "nix " modern-kind)
+                          "nix-shell"))
+         (label (if display-arguments
+                    (format "❄ %s  %s" command-label
+                            (string-join (or packages display-arguments) " "))
+                  (format "❄ %s" command-label))))
     (propertize label 'face 'eshell-nix-shell-prompt)))
 
 ;;;###autoload
@@ -860,7 +957,7 @@ With FORCE, remove the advice regardless of the remaining users."
 
 ;;;###autoload
 (define-minor-mode eshell-nix-shell-mode
-  "Manage interactive legacy Nix shell environments in this Eshell buffer.
+  "Manage interactive Nix shell environments in this Eshell buffer.
 Disabling the mode restores all active environments in last-in, first-out
 order.  It refuses to disable while activation is in progress."
   :lighter " NixSh"
@@ -901,6 +998,12 @@ Package-name completion is an intentionally reserved extension point."
        ;; Extension point: cached/asynchronous package completion after -p.
        (t (pcomplete-here (pcomplete-entries nil (lambda (file)
                                                    (string-suffix-p ".nix" file)))))))))
+
+(defun pcomplete/eshell-mode/nix ()
+  "Complete supported modern Nix shell subcommands.
+Completion after the subcommand is deliberately left to Nix-aware completion
+packages, which can provide installable and flake-reference candidates."
+  (pcomplete-here* '("shell" "develop")))
 
 (autoload 'tramp-local-environment-variable-p "tramp")
 
