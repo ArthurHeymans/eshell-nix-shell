@@ -622,6 +622,13 @@ advised functions without an enabled mode must claim it themselves."
     (should (string-match-p "introduced:one"
                             (eshell-nix-shell-tests--command "ens-new-command")))))
 
+(ert-deftest eshell-nix-shell-integration-bare-modern-develop ()
+  "A bare `nix develop' invocation activates the current flake."
+  (eshell-nix-shell-tests--with-fake
+    (eshell-nix-shell-tests--command "nix develop")
+    (should (equal (getenv "FAKE_LAYER") "develop"))
+    (should (= (length eshell-nix-shell--environment-stack) 1))))
+
 (ert-deftest eshell-nix-shell-integration-modern-shell-and-develop ()
   "Modern Nix shell commands import environments and nest normally."
   (eshell-nix-shell-tests--with-fake

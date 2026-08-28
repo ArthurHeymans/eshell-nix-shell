@@ -715,9 +715,8 @@ activation function receives the subcommand separately."
    ((string= command "nix")
     (when-let* ((invocation (eshell-nix-shell--modern-invocation arguments))
                 (kind (car invocation))
-                (modern-arguments (cdr invocation))
                 ((eshell-nix-shell--modern-activation-p
-                  kind modern-arguments)))
+                  kind (cdr invocation))))
       (eshell-nix-shell--check-context)
       (eshell-lisp-command #'eshell-nix-shell--activate invocation)))))
 
