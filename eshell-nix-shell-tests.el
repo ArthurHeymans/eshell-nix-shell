@@ -479,7 +479,7 @@ advised functions without an enabled mode must claim it themselves."
                      (concat "/usr/bin/nix-shell"
                              " (activation managed by eshell-nix-shell-mode)")))
       (should-not (eshell-nix-shell--which "nix-build")))
-    (let ((eshell-nix-executable "nix"))
+    (let ((eshell-nix-shell-nix-executable "nix"))
       (cl-letf (((symbol-function 'eshell-nix-shell--external-file-name)
                  (lambda (_command) "/usr/bin/nix")))
         (should (equal (eshell-nix-shell--which "nix")
@@ -609,7 +609,7 @@ advised functions without an enabled mode must claim it themselves."
          (eshell-set-path (eshell-nix-shell--path-list (getenv "PATH")))
          (setq-local exec-path (eshell-nix-shell--exec-path (getenv "PATH")))
          (let ((eshell-nix-shell-executable shell)
-               (eshell-nix-executable nix))
+               (eshell-nix-shell-nix-executable nix))
            (eshell-nix-shell-mode 1)
            ,@body)))))
 
@@ -743,7 +743,7 @@ advised functions without an enabled mode must claim it themselves."
 (ert-deftest eshell-nix-shell-debug-records-lifecycle-only ()
   "Debug logging writes lifecycle text to its dedicated buffer."
   (let ((eshell-nix-shell-debug t))
-    (when-let ((buffer (get-buffer "*eshell-nix-shell-debug*")))
+    (when-let* ((buffer (get-buffer "*eshell-nix-shell-debug*")))
       (kill-buffer buffer))
     (eshell-nix-shell--debug "synthetic lifecycle event")
     (with-current-buffer "*eshell-nix-shell-debug*"
