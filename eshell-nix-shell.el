@@ -8,7 +8,7 @@
 ;; Version: 0.1.0
 ;; Package-Requires: ((emacs "30.1"))
 ;; Keywords: processes, unix
-;; URL: https://github.com/aheymans/eshell-nix-shell
+;; URL: https://github.com/ArthurHeymans/eshell-nix-shell
 
 ;; This file is not part of GNU Emacs.
 
@@ -60,7 +60,7 @@ This may be an absolute path.  Command interception intentionally remains
 attached to the unqualified Eshell command name `nix-shell'."
   :type 'string)
 
-(defcustom eshell-nix-executable "nix"
+(defcustom eshell-nix-shell-nix-executable "nix"
   "Executable used for `nix shell' and `nix develop' environments.
 This may be an absolute path.  Command interception intentionally remains
 attached to the unqualified Eshell command name `nix'."
@@ -87,7 +87,7 @@ continues."
   '("PS1" "PWD" "OLDPWD" "SHLVL" "_" "IN_NIX_SHELL" "NIX_BUILD_TOP"
     "NIX_BUILD_CORES" "TMPDIR" "TMP" "TEMP" "TEMPDIR")
   "Environment variable names that must not be imported from Nix.
-The parent values of `INSIDE_EMACS' and `TERM' are always preserved too."
+The parent values of \"INSIDE_EMACS\" and \"TERM\" are always preserved too."
   :type '(repeat string))
 
 (defcustom eshell-nix-shell-prompt-format-function
@@ -165,7 +165,7 @@ that Eshell rebinds, such as `process-environment' or variable `exec-path'."
   (when eshell-nix-shell-debug
     (with-current-buffer (get-buffer-create "*eshell-nix-shell-debug*")
       (goto-char (point-max))
-      (insert (format-time-string "%Y-%m-%d %H:%M:%S ")
+      (insert (format-time-string "%F %T ")
               (apply #'format format-string arguments) "\n"))))
 
 (defun eshell-nix-shell--diagnose (format-string &rest arguments)
@@ -601,7 +601,7 @@ called directly."
   (let* ((legacy-p (string= kind "nix-shell"))
          (executable (if legacy-p
                          eshell-nix-shell-executable
-                       eshell-nix-executable))
+                       eshell-nix-shell-nix-executable))
          (capture-shell
           (unless legacy-p
             (or (eshell-nix-shell--external-file-name "bash")
@@ -736,7 +736,7 @@ that do not provide it."
   (when (member command '("nix-shell" "nix"))
     (let* ((configured (if (string= command "nix-shell")
                            eshell-nix-shell-executable
-                         eshell-nix-executable))
+                         eshell-nix-shell-nix-executable))
            (external (eshell-nix-shell--external-file-name configured)))
       (format "%s (activation managed by eshell-nix-shell-mode)"
               (or external configured)))))
@@ -750,9 +750,9 @@ that do not provide it."
                            (car arguments)))
          (display-arguments (if modern-kind (cdr arguments) arguments))
          (package-tail
-          (cdr (cl-member-if (lambda (argument)
-                               (member argument '("-p" "--packages")))
-                             display-arguments)))
+          (cdr (seq-drop-while (lambda (argument)
+                                   (not (member argument '("-p" "--packages"))))
+                                 display-arguments)))
          (packages
           (and package-tail
                (seq-take-while
@@ -875,8 +875,7 @@ and may change between Emacs releases.  Missing pieces degrade gracefully, and
                                      eshell-nix-shell--required-internals)))
       (display-warning
        'eshell-nix-shell
-       (format (concat "This Emacs (%s) lacks the Eshell function(s) %s; "
-                       "eshell-nix-shell may behave unexpectedly")
+       (format "This Emacs (%s) lacks the Eshell function(s) %s; eshell-nix-shell may behave unexpectedly"
                emacs-version
                (mapconcat #'symbol-name missing ", "))
        :warning))))
@@ -885,12 +884,15 @@ and may change between Emacs releases.  Missing pieces degrade gracefully, and
   "Number of buffers that currently require the global advice.")
 
 (defconst eshell-nix-shell--advice
-  '((eshell/exit . eshell-nix-shell--exit-advice)
+  `((eshell/exit . eshell-nix-shell--exit-advice)
     (eshell-get-path . eshell-nix-shell--get-path-advice)
     (eshell-set-path . eshell-nix-shell--set-path-advice)
     (eshell-get-variable . eshell-nix-shell--get-variable-advice)
-    (tramp-local-environment-variable-p
-     . eshell-nix-shell--tramp-local-environment-variable-advice))
+    ;; `tramp-local-environment-variable-p' only exists in Emacs 31.1
+    ;; and later; advising it is skipped where it is unavailable.
+    ,@(and (fboundp 'tramp-local-environment-variable-p)
+            '((tramp-local-environment-variable-p
+               . eshell-nix-shell--tramp-local-environment-variable-advice))))
   "Alist of globally advised functions and their `:around' advice.")
 
 (defun eshell-nix-shell--install-advice ()

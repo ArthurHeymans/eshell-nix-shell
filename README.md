@@ -113,7 +113,7 @@ Directory changes made by `shellHook` are ignored by default. To apply them:
 ### Other options
 
 - `eshell-nix-shell-executable` selects the legacy executable to launch.
-- `eshell-nix-executable` selects the modern `nix` executable to launch.
+- `eshell-nix-shell-nix-executable` selects the modern `nix` executable to launch.
 - `eshell-nix-shell-excluded-variables` controls which variables are not
   imported.
 - `eshell-nix-shell-process-kill-timeout` bounds the wait for a cancelled
