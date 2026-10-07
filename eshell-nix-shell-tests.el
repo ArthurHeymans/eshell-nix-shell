@@ -379,6 +379,24 @@ advised functions without an enabled mode must claim it themselves."
     (should (string-match-p "compgen -e" payload))
     (should-not (string-match-p "env -0" payload))))
 
+(ert-deftest eshell-nix-shell-payload-preserves-exported-iterator-name ()
+  "Capture does not overwrite an exported variable, even when readonly."
+  (skip-unless (executable-find "bash"))
+  (let ((capture (eshell-nix-shell--make-capture)))
+    (unwind-protect
+        (progn
+          (should
+           (= 0 (call-process
+                 "bash" nil nil nil "-c"
+                 (concat "export n='original value'; readonly n\n"
+                         (eshell-nix-shell--payload capture)))))
+          (should
+           (equal (eshell-nix-shell--env-value
+                   "n" (eshell-nix-shell--parse-environment
+                        (plist-get capture :environment-file)))
+                  "original value")))
+      (eshell-nix-shell--cleanup-capture capture))))
+
 (ert-deftest eshell-nix-shell-import-restores-remote-directory-prefix ()
   "A remote capture turns the shell's local PWD into a Tramp name."
   (let ((environment-file
