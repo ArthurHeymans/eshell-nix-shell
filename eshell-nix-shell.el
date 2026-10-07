@@ -435,7 +435,9 @@ On a remote Eshell, create the files on the same host as the shell."
 
 (defun eshell-nix-shell--payload (capture)
   "Return the Bash capture payload for CAPTURE."
-  (format "{ for n in $(compgen -e); do printf \"%%s=%%s\\0\" \"$n\" \"${!n}\"; done; } > %s\nprintf \"%%s\\0\" \"$PWD\" > %s"
+  ;; Positional parameters avoid overwriting an exported (or readonly)
+  ;; variable with the capture loop's iterator.  Isolate them in a subshell.
+  (format "( set -- $(compgen -e); while (( $# )); do printf \"%%s=%%s\\0\" \"$1\" \"${!1}\"; shift; done; ) > %s\nprintf \"%%s\\0\" \"$PWD\" > %s"
           (shell-quote-argument
            (file-local-name (plist-get capture :environment-file)))
           (shell-quote-argument
