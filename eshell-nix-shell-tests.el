@@ -484,6 +484,108 @@ advised functions without an enabled mode must claim it themselves."
     (eshell-nix-shell-tests--with-advice
       (should (equal (eshell-get-variable "ENS_COLLISION") "remote")))))
 
+(defmacro eshell-nix-shell-tests--with-remote-environment (&rest body)
+  "Run BODY in a synthetic remote Eshell with a managed environment."
+  (declare (indent 0) (debug t))
+  `(eshell-nix-shell-tests--with-eshell
+     (setq-local eshell-prefer-lisp-functions t
+                 eshell-prompt-function (lambda () "P> "))
+     (eshell-nix-shell-mode 1)
+     (setq default-directory "/ssh:ens-environment-test:/tmp/")
+     (cl-letf (((symbol-function 'tramp-get-remote-path)
+                (lambda (_vector) '("/remote/old"))))
+       (eshell-set-path '("/remote/old"))
+       (eshell-nix-shell--apply
+        '("PATH=/remote/bin" "HOME=/remote/home" "ENS_REMOTE=original")
+        nil nil)
+       ,@body)))
+
+(ert-deftest eshell-nix-shell-remote-assignments-update-imported-values ()
+  "Assignments update expansion and forwarded entries, not local transport."
+  (eshell-nix-shell-tests--with-remote-environment
+    (let ((local-home (getenv "HOME")))
+      (eshell-nix-shell-tests--command "export HOME=/remote/changed")
+      (should (equal (eshell-get-variable "HOME") "/remote/changed"))
+      (should (equal (getenv "HOME") local-home))
+      (should (member "HOME=/remote/changed" process-environment))
+      (should-not (member "HOME=/remote/home" process-environment))
+      (when (fboundp 'tramp-local-environment-variable-p)
+        (should-not
+         (tramp-local-environment-variable-p "HOME=/remote/changed"))))
+    (eshell-set-variable "ENS_REMOTE" "changed")
+    (should (equal (eshell-get-variable "ENS_REMOTE") "changed"))
+    (should (member "ENS_REMOTE=changed" process-environment))
+    (should-not (member "ENS_REMOTE=original" process-environment))
+    (eshell-set-variable "ENS_REMOTE" nil)
+    (should-not (eshell-get-variable "ENS_REMOTE"))
+    (should-not (member "ENS_REMOTE=changed" process-environment))))
+
+(ert-deftest eshell-nix-shell-remote-path-updates-forwarded-environment ()
+  "Both PATH aliases and direct path setters update the forwarded PATH."
+  (eshell-nix-shell-tests--with-remote-environment
+    (let ((local-path (getenv "PATH")))
+      (eshell-nix-shell-tests--command "export PATH=/changed/bin:/other/bin")
+      (should (equal (eshell-get-path t) '("/changed/bin" "/other/bin")))
+      (should (equal (eshell-get-variable "PATH") "/changed/bin:/other/bin"))
+      (should (member "PATH=/changed/bin:/other/bin" process-environment))
+      (should-not (member "PATH=/remote/bin" process-environment))
+      (should (equal (getenv "PATH") local-path))
+      (eshell-set-path '("/direct/bin"))
+      (should (equal (eshell-get-path t) '("/direct/bin")))
+      (should (member "PATH=/direct/bin" process-environment))
+      (should-not (member "PATH=/changed/bin:/other/bin" process-environment))
+      (should (equal (getenv "PATH") local-path)))))
+
+(ert-deftest eshell-nix-shell-remote-setters-preserve-transport-overrides ()
+  "Remote setters retain transport overrides and identical duplicate values."
+  (eshell-nix-shell-tests--with-remote-environment
+    (setenv "SSH_AUTH_SOCK" "/tmp/ens-test-agent.sock")
+    (let ((local-home (getenv "HOME")))
+      (eshell-set-variable "HOME" local-home)
+      (eshell-set-variable "HOME" "/remote/changed")
+      (should (equal (getenv "HOME") local-home))
+      (should (equal (eshell-get-variable "HOME") "/remote/changed")))
+    (should (equal (getenv "SSH_AUTH_SOCK") "/tmp/ens-test-agent.sock"))
+    (eshell-set-path '("/changed/bin"))
+    (should (equal (getenv "SSH_AUTH_SOCK") "/tmp/ens-test-agent.sock"))
+    (eshell-nix-shell-tests--command
+     "ENS_REMOTE=temporary eshell-get-variable ENS_REMOTE")
+    (eshell-nix-shell-tests--command
+     "PATH=/temporary/bin eshell-get-variable PATH")
+    (should (equal (getenv "SSH_AUTH_SOCK") "/tmp/ens-test-agent.sock"))
+    (should (equal (eshell-get-variable "ENS_REMOTE") "original"))
+    (should (equal (eshell-get-path t) '("/changed/bin")))))
+
+(ert-deftest eshell-nix-shell-remote-assignments-respect-local-scopes ()
+  "Command-local variables and subcommands do not change the outer environment."
+  (eshell-nix-shell-tests--with-remote-environment
+    (should (string-match-p
+             "temporary"
+             (eshell-nix-shell-tests--command
+              "ENS_REMOTE=temporary eshell-get-variable ENS_REMOTE")))
+    (should (equal (eshell-get-variable "ENS_REMOTE") "original"))
+    (should (member "ENS_REMOTE=original" process-environment))
+    (should-not (member "ENS_REMOTE=temporary" process-environment))
+    (should (string-match-p
+             "/temporary/bin"
+             (eshell-nix-shell-tests--command
+              "PATH=/temporary/bin eshell-get-variable PATH")))
+    (should (equal (eshell-get-path t) '("/remote/bin")))
+    (should (member "PATH=/remote/bin" process-environment))
+    (should (string-match-p
+             "nested"
+             (eshell-nix-shell-tests--command
+              "identity ${export ENS_REMOTE=nested; eshell-get-variable ENS_REMOTE}")))
+    (should (equal (eshell-get-variable "ENS_REMOTE") "original"))
+    (let ((bindings eshell-local-variable-bindings))
+      (eshell-nix-shell-mode 1)
+      (should (equal eshell-local-variable-bindings bindings)))
+    (eshell-nix-shell-mode -1)
+    (should-not (assq 'eshell-nix-shell--remote-environment
+                      eshell-local-variable-bindings))
+    (should-not (assq 'eshell-nix-shell--remote-path
+                      eshell-subcommand-bindings))))
+
 (ert-deftest eshell-nix-shell-remote-path-is-buffer-local ()
   "Managed PATH values do not leak between Eshell buffers on one connection."
   (let ((first (generate-new-buffer " *ens-remote-first*"))
@@ -1012,7 +1114,9 @@ advised functions without an enabled mode must claim it themselves."
   (eshell-nix-shell-tests--with-eshell
     (eshell-nix-shell-mode 1)
     (dolist (entry eshell-nix-shell--advice)
-      (should (advice-member-p (cdr entry) (car entry))))
+      (if (fboundp (car entry))
+          (should (advice-member-p (cdr entry) (car entry)))
+        (should-not (advice-member-p (cdr entry) (car entry)))))
     ;; A second user keeps the advice installed after the first releases it.
     (eshell-nix-shell-tests--with-eshell
       (eshell-nix-shell-mode 1)

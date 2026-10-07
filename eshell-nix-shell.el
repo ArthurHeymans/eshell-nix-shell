@@ -207,10 +207,19 @@ When LITERAL-P is non-nil, do not add the remote file-name prefix."
   "Set the managed per-buffer remote PATH, or call ORIGINAL with PATH."
   (if (and eshell-nix-shell--remote-path-active-p
            (file-remote-p default-directory))
-      (setq eshell-nix-shell--remote-path
-            (if (listp path)
-                (copy-sequence path)
-              (eshell-nix-shell--path-list path)))
+      (let ((old-environment eshell-nix-shell--remote-environment))
+        (setq eshell-nix-shell--remote-path
+              (if (listp path)
+                  (copy-sequence path)
+                (eshell-nix-shell--path-list path))
+              eshell-nix-shell--remote-environment
+              (setenv-internal
+               (copy-sequence eshell-nix-shell--remote-environment)
+               "PATH" (string-join eshell-nix-shell--remote-path
+                                   (path-separator)) t))
+        (setq process-environment
+              (eshell-nix-shell--remote-process-environment old-environment))
+        eshell-nix-shell--remote-path)
     (funcall original path)))
 
 (defun eshell-nix-shell--get-variable-advice
@@ -228,6 +237,36 @@ INDICES and QUOTED have the meaning used by `eshell-get-variable'."
               (substring entry (1+ (string-search "=" entry))))
          indices quoted)
       (funcall original name indices quoted))))
+
+(defun eshell-nix-shell--remote-process-environment (old-environment)
+  "Replace OLD-ENVIRONMENT's forwarded entries with the managed remote values.
+Preserve the current local transport entries, including buffer-local overrides."
+  (let ((transport (reverse process-environment)))
+    ;; Forwarded entries follow transport entries.  Remove one occurrence
+    ;; from the end so identical local and remote values remain distinct.
+    (dolist (entry old-environment)
+      (setq transport (cl-delete entry transport :test #'equal :count 1)))
+    (append (nreverse transport)
+            (copy-sequence eshell-nix-shell--remote-environment))))
+
+(defun eshell-nix-shell--set-variable-advice (original name value)
+  "Update managed remote NAME with VALUE, or call ORIGINAL unchanged.
+Eshell aliases retain their own setters, including the managed PATH setter."
+  (if (and eshell-nix-shell--remote-path-active-p
+           (file-remote-p default-directory)
+           (stringp name)
+           (not (assoc name eshell-variable-aliases-list)))
+      (let* ((old-environment eshell-nix-shell--remote-environment)
+             (result
+              (let ((process-environment
+                     (copy-sequence eshell-nix-shell--remote-environment)))
+                (prog1 (funcall original name value)
+                  (setq eshell-nix-shell--remote-environment
+                        process-environment)))))
+        (setq process-environment
+              (eshell-nix-shell--remote-process-environment old-environment))
+        result)
+    (funcall original name value)))
 
 (defun eshell-nix-shell--tramp-local-environment-variable-advice
     (original argument)
@@ -903,15 +942,13 @@ and may change between Emacs releases.  Missing pieces degrade gracefully, and
   "Number of buffers that currently require the global advice.")
 
 (defconst eshell-nix-shell--advice
-  `((eshell/exit . eshell-nix-shell--exit-advice)
+  '((eshell/exit . eshell-nix-shell--exit-advice)
     (eshell-get-path . eshell-nix-shell--get-path-advice)
     (eshell-set-path . eshell-nix-shell--set-path-advice)
     (eshell-get-variable . eshell-nix-shell--get-variable-advice)
-    ;; `tramp-local-environment-variable-p' only exists in Emacs 31.1
-    ;; and later; advising it is skipped where it is unavailable.
-    ,@(and (fboundp 'tramp-local-environment-variable-p)
-            '((tramp-local-environment-variable-p
-               . eshell-nix-shell--tramp-local-environment-variable-advice))))
+    (eshell-set-variable . eshell-nix-shell--set-variable-advice)
+    (tramp-local-environment-variable-p
+     . eshell-nix-shell--tramp-local-environment-variable-advice))
   "Alist of globally advised functions and their `:around' advice.")
 
 (defun eshell-nix-shell--install-advice ()
@@ -919,8 +956,12 @@ and may change between Emacs releases.  Missing pieces degrade gracefully, and
 Installation is deferred to the first buffer that enables the mode so that
 merely loading the library changes no behavior."
   (eshell-nix-shell--verify-internals)
+  ;; Detect optional Tramp functions after loading it, rather than freezing
+  ;; their availability when this library is first loaded.
+  (require 'tramp)
   (pcase-dolist (`(,symbol . ,function) eshell-nix-shell--advice)
-    (advice-add symbol :around function)))
+    (when (fboundp symbol)
+      (advice-add symbol :around function))))
 
 (defun eshell-nix-shell--remove-advice ()
   "Remove the global advice installed by this package."
@@ -950,6 +991,24 @@ With FORCE, remove the advice regardless of the remaining users."
   (eshell-nix-shell--cleanup-all)
   (eshell-nix-shell--release-advice))
 
+(defconst eshell-nix-shell--scope-bindings
+  '((eshell-nix-shell--remote-environment
+     (copy-sequence eshell-nix-shell--remote-environment))
+    (eshell-nix-shell--remote-path
+     (copy-sequence eshell-nix-shell--remote-path)))
+  "Managed state that follows Eshell's temporary variable scopes.")
+
+(defun eshell-nix-shell--configure-scopes (enable)
+  "Add managed bindings to Eshell scopes when ENABLE is non-nil; remove otherwise."
+  (dolist (variable '(eshell-local-variable-bindings eshell-subcommand-bindings))
+    (let ((bindings
+           (seq-remove
+            (lambda (binding)
+              (assq (car binding) eshell-nix-shell--scope-bindings))
+            (symbol-value variable))))
+      (set (make-local-variable variable)
+           (append (and enable eshell-nix-shell--scope-bindings) bindings)))))
+
 (defun eshell-nix-shell--disable (&optional force)
   "Remove local integration and restore frames; FORCE cancels activation."
   (when (and eshell-nix-shell--pending-capture (not force))
@@ -970,6 +1029,7 @@ With FORCE, remove the advice regardless of the remaining users."
       (remove-hook 'eshell-kill-hook #'eshell-nix-shell--kill-hook t)
       (remove-hook 'kill-buffer-hook #'eshell-nix-shell--kill-buffer-hook t)
       (eshell-nix-shell--remove-prompt)
+      (eshell-nix-shell--configure-scopes nil)
       (eshell-nix-shell--cleanup-all)
       (eshell-nix-shell--release-advice))
     (when (and first-error (not force))
@@ -987,6 +1047,7 @@ order.  It refuses to disable while activation is in progress."
           (setq eshell-nix-shell-mode nil)
           (user-error "Eshell Nix Shell mode only works in Eshell buffers"))
         (eshell-nix-shell--claim-advice)
+        (eshell-nix-shell--configure-scopes t)
         (add-hook 'eshell-named-command-hook
                   #'eshell-nix-shell--command-handler nil t)
         ;; Depth -90 keeps the import ahead of user hooks that inspect the
@@ -1025,7 +1086,7 @@ Completion after the subcommand is deliberately left to Nix-aware completion
 packages, which can provide installable and flake-reference candidates."
   (pcomplete-here* '("shell" "develop")))
 
-(autoload 'tramp-local-environment-variable-p "tramp")
+(declare-function tramp-local-environment-variable-p "tramp" (arg))
 
 (defun eshell-nix-shell-unload-function ()
   "Restore managed Eshell buffers and remove global integration."
