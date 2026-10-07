@@ -623,10 +623,23 @@ called directly."
                              (length arguments))
     (condition-case error-data
         (progn
-          (setq result (eshell-external-command executable args))
+          ;; Track the writer before user exec hooks can quit, but do not
+          ;; mark it for import yet: a hook can wait for completion while
+          ;; Eshell still has a temporary process environment bound.
+          (let ((eshell-exec-hook
+                 (cons (lambda (process)
+                         (when (and (processp process)
+                                    (not eshell-nix-shell--pending-process))
+                           (setq eshell-nix-shell--pending-process process)))
+                       eshell-exec-hook)))
+            (setq result (eshell-external-command executable args)))
           (when (processp result)
+            (setq eshell-nix-shell--pending-process result)
             (process-put result 'eshell-nix-shell--capture capture)
-            (setq eshell-nix-shell--pending-process result))
+            ;; A user exec hook may already have waited for the process;
+            ;; import only now, after Eshell's launch bindings have unwound.
+            (unless (process-live-p result)
+              (eshell-nix-shell--kill-hook result (process-exit-status result))))
           ;; `eshell-lisp-command' catches this tag to hand its caller the
           ;; external command's result unchanged.  The tag is an Eshell
           ;; internal, so a release that drops it must not break activation:
@@ -638,10 +651,10 @@ called directly."
              (eshell-nix-shell--debug
               "No `eshell-external' catch in this Emacs; returning result")
              result)))
-      (error
-       (setq eshell-nix-shell--pending-process nil
-             eshell-nix-shell--pending-capture nil)
-       (eshell-nix-shell--cleanup-capture capture)
+      ((error quit)
+       (let ((inhibit-quit t))
+         (eshell-nix-shell--cancel-pending)
+         (eshell-nix-shell--cleanup-capture capture))
        (signal (car error-data) (cdr error-data))))))
 
 (put 'eshell-nix-shell--activate 'eshell-no-numeric-conversions t)

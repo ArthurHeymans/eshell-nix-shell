@@ -793,6 +793,98 @@ advised functions without an enabled mode must claim it themselves."
       (should (= (length files) 2))
       (should-not (seq-some #'file-exists-p files)))))
 
+(ert-deftest eshell-nix-shell-quit-during-launch-cleans-capture ()
+  "A quit during process launch leaves the buffer ready for reuse."
+  (eshell-nix-shell-tests--with-fake
+    (let ((original (symbol-function 'eshell-nix-shell--make-capture))
+          (before (copy-sequence process-environment))
+          files caught)
+      (cl-letf (((symbol-function 'eshell-nix-shell--make-capture)
+                 (lambda ()
+                   (let ((capture (funcall original)))
+                     (setq files (list (plist-get capture :environment-file)
+                                       (plist-get capture :directory-file)))
+                     capture)))
+                ((symbol-function 'eshell-external-command)
+                 (lambda (&rest _arguments) (signal 'quit nil))))
+        (condition-case nil
+            (eshell-nix-shell--activate "nix-shell")
+          (quit (setq caught t))))
+      (should caught)
+      (should (= (length files) 2))
+      (should-not (seq-some #'file-exists-p files))
+      (should-not eshell-nix-shell--capture-files)
+      (should-not eshell-nix-shell--pending-process)
+      (should-not eshell-nix-shell--pending-capture)
+      (should-not eshell-nix-shell--environment-stack)
+      (should (equal process-environment before))
+      (eshell-nix-shell-tests--command "nix-shell")
+      (should (= (length eshell-nix-shell--environment-stack) 1))
+      (eshell-nix-shell-mode -1)
+      (should-not eshell-nix-shell-mode))))
+
+(ert-deftest eshell-nix-shell-quit-after-spawn-terminates-writer ()
+  "A quit from an exec hook kills the writer before removing capture files."
+  (eshell-nix-shell-tests--with-fake
+    (with-temp-file shell
+      (insert (format "#!%s\n" bash)
+              "sleep 0.5\n"
+              "while [[ $1 != --run ]]; do shift; done\n"
+              "eval \"$2\"\n"))
+    (let* ((original (symbol-function 'eshell-nix-shell--make-capture))
+           process files caught
+           (eshell-exec-hook
+            (list (lambda (started)
+                    (setq process started)
+                    (signal 'quit nil)))))
+      (cl-letf (((symbol-function 'eshell-nix-shell--make-capture)
+                 (lambda ()
+                   (let ((capture (funcall original)))
+                     (setq files (list (plist-get capture :environment-file)
+                                       (plist-get capture :directory-file)))
+                     capture))))
+        (condition-case nil
+            (eshell-nix-shell-tests--command "nix-shell")
+          (quit (setq caught t))))
+      (should caught)
+      (should (processp process))
+      (should-not (process-live-p process))
+      ;; Let a mistakenly surviving writer reach its payload before checking.
+      (accept-process-output nil 0.6)
+      (should-not (seq-some #'file-exists-p files))
+      (should-not eshell-nix-shell--capture-files)
+      (should-not eshell-nix-shell--pending-capture)
+      (should-not eshell-nix-shell--pending-process))))
+
+(ert-deftest eshell-nix-shell-completion-during-launch-is-deferred ()
+  "Exec hooks can await completion without importing into launch bindings."
+  (dolist (interrupt '(nil t))
+    (eshell-nix-shell-tests--with-fake
+      (let* ((before (copy-sequence process-environment))
+             caught
+             (eshell-exec-hook
+              (list (lambda (process)
+                      (let ((deadline (+ (float-time) 5)))
+                        (while (and (process-live-p process)
+                                    (< (float-time) deadline))
+                          (accept-process-output process 0.01)))
+                      (should-not (process-live-p process))
+                      (should-not eshell-nix-shell--environment-stack)
+                      (when interrupt (signal 'quit nil))))))
+        (condition-case nil
+            (eshell-nix-shell-tests--command "nix-shell")
+          (quit (setq caught t)))
+        (should (eq caught interrupt))
+        (if interrupt
+            (progn
+              (should-not eshell-nix-shell--environment-stack)
+              (should (equal process-environment before)))
+          (should (= (length eshell-nix-shell--environment-stack) 1))
+          (should (equal (getenv "FAKE_LAYER") "default")))
+        (should-not eshell-nix-shell--pending-process)
+        (should-not eshell-nix-shell--pending-capture)
+        (should-not eshell-nix-shell--capture-files)))))
+
 (ert-deftest eshell-nix-shell-pending-disable-keeps-mode-enabled ()
   "Rejected disable leaves the mode and its integration intact."
   (eshell-nix-shell-tests--with-eshell
