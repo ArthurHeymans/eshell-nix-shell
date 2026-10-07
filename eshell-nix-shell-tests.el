@@ -188,6 +188,24 @@ advised functions without an enabled mode must claim it themselves."
         (should-not (local-variable-p 'exec-path))
         (should (equal exec-path original-exec))))))
 
+(ert-deftest eshell-nix-shell-restore-local-path-after-remote-cd ()
+  "Restoring a local frame does not overwrite the remote path cache."
+  (eshell-nix-shell-tests--with-eshell
+    (eshell-nix-shell-mode 1)
+    (setq-local process-environment '("PATH=/parent/bin"))
+    (eshell-set-path '("/parent/bin"))
+    (let ((directory default-directory)
+          (remote "/ssh:ens-path-restore-test:/tmp/"))
+      (eshell-nix-shell--apply '("PATH=/inner/bin") nil nil)
+      (setq default-directory remote)
+      (eshell-set-path '("/remote/bin"))
+      (eshell-nix-shell-pop)
+      (should (equal default-directory directory))
+      (should (equal (eshell-get-path t) '("/parent/bin")))
+      (should (equal (getenv "PATH") "/parent/bin"))
+      (let ((default-directory remote))
+        (should (equal (eshell-get-path t) '("/remote/bin")))))))
+
 (ert-deftest eshell-nix-shell-nested-lifo ()
   "Synthetic activations pop in last-in, first-out order."
   (eshell-nix-shell-tests--with-eshell

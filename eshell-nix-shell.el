@@ -240,6 +240,9 @@ Call ORIGINAL for variables not managed by the active Nix environment."
 
 (defun eshell-nix-shell--restore-frame (frame)
   "Restore all buffer state saved in FRAME."
+  ;; Eshell's path cache is connection-local: select the saved connection
+  ;; before restoring it, not the connection we are leaving.
+  (setq default-directory (eshell-nix-shell--frame-default-directory frame))
   (eshell-nix-shell--setq-local-env process-environment
     (copy-sequence
      (eshell-nix-shell--frame-process-environment frame)))
@@ -259,8 +262,7 @@ Call ORIGINAL for variables not managed by the active Nix environment."
   (if (eshell-nix-shell--frame-exec-path-local-p frame)
       (eshell-nix-shell--setq-local-env exec-path
         (copy-sequence (eshell-nix-shell--frame-exec-path frame)))
-    (kill-local-variable 'exec-path))
-  (setq default-directory (eshell-nix-shell--frame-default-directory frame)))
+    (kill-local-variable 'exec-path)))
 
 (defun eshell-nix-shell--capture-frame (arguments)
   "Capture current buffer state in a frame labelled by ARGUMENTS."
