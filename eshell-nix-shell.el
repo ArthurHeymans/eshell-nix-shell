@@ -846,11 +846,13 @@ Return the empty string when no environment is active."
 
 (defun eshell-nix-shell--ctrl-d ()
   "Pop an active environment at an empty prompt, otherwise handle `C-d'.
+Only intercept end-of-file when `eshell-nix-shell-use-exit-advice' is non-nil.
 The fallback command is resolved with this minor mode temporarily disabled, so
 user configurations such as Doom Eshell retain their normal delete-or-exit
 behavior."
   (interactive)
-  (if (and eshell-nix-shell--environment-stack
+  (if (and eshell-nix-shell-use-exit-advice
+           eshell-nix-shell--environment-stack
            (eobp)
            (= (point) eshell-last-output-end)
            (not (eshell-head-process)))

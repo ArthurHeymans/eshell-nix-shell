@@ -244,6 +244,21 @@ advised functions without an enabled mode must claim it themselves."
       (should (equal (buffer-substring-no-properties start (point-max))
                      "\n❄ nix-shell  outer\nP> ")))))
 
+(ert-deftest eshell-nix-shell-ctrl-d-respects-exit-opt-out ()
+  "Disabling exit interception delegates EOF to the underlying key binding."
+  (eshell-nix-shell-tests--with-eshell
+    (let ((eshell-nix-shell-use-exit-advice nil)
+          handled)
+      (local-set-key (kbd "C-d")
+                     (lambda () (interactive) (setq handled t)))
+      (eshell-nix-shell-mode 1)
+      (eshell-nix-shell--apply '("PATH=/inner/bin" "L=inner") nil nil)
+      (goto-char (point-max))
+      (eshell-nix-shell--ctrl-d)
+      (should handled)
+      (should (= (length eshell-nix-shell--environment-stack) 1))
+      (should (equal (getenv "L") "inner")))))
+
 (ert-deftest eshell-nix-shell-apply-is-atomic ()
   "An error during activation restores state and stack depth."
   (eshell-nix-shell-tests--with-eshell
